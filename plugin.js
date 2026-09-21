@@ -7,6 +7,11 @@
  * from the command palette. Point it at a LAN status page, Grafana, Uptime Kuma,
  * a static report — anything served over http(s).
  *
+ * The page may also ask the app for one thing: a message
+ * `{ source: 'hermes-fleet', type: 'open-session', session, profile }` from the
+ * embedded origin makes the app open that session (a "open session" button on
+ * rows that need you). Only the configured origin may ask.
+ *
  * UI: the app's own kit (`Button`, `Input`, `EmptyState`, `GlyphSpinner`,
  * `StatusDot`, `cn`) rather than hand-rolled markup, so the pane inherits the
  * app's focus rings, variants, dark mode and motion. Load state is a first-class
@@ -59,6 +64,10 @@ const DEFAULT_REFRESH = 0 // 0 = the embedded page handles its own refresh
 // failure: a blocked embed and a dead host both look like "no load event yet".
 const SLOW_MS = 10_000
 
+// The embedded page asks for a session jump with this message shape (see the
+// message effect in `Page`). A tag, not a secret: the origin check is the guard.
+const MESSAGE_SOURCE = 'hermes-fleet'
+
 const LOCALES = {
   en: {
     label: 'Fleet',
@@ -87,6 +96,7 @@ const LOCALES = {
     slowBody:
       'This page has not finished loading. It may be slow, unreachable, or refusing to be embedded (X-Frame-Options).',
     retry: 'Retry',
+    openFailed: 'Could not open that session',
     notSet: 'not set',
     changeHint: 'rename applies after "Reload desktop plugins"',
     embedNote:
@@ -119,6 +129,7 @@ const LOCALES = {
     slowBody:
       'Esta página ainda não acabou de carregar. Pode estar lenta, inacessível, ou a recusar ser embutida (X-Frame-Options).',
     retry: 'Tentar de novo',
+    openFailed: 'Não foi possível abrir essa sessão',
     notSet: 'não definido',
     changeHint: 'o novo nome aplica-se após "Recarregar plugins do desktop"',
     embedNote:
@@ -145,6 +156,15 @@ function normalizeUrl(raw) {
   }
 
   return `http://${trimmed.replace(/^\/+/, '')}`
+}
+
+/** The origin of a configured URL, or '' when it cannot be parsed. */
+function originOf(url) {
+  try {
+    return new URL(url).origin
+  } catch {
+    return ''
+  }
 }
 
 function readConfig(storage, fallbackLabel = DEFAULT_LABEL) {
@@ -377,6 +397,50 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
   }, [config.url, editing, frame.state, nonce, slowMs])
 
   const openExternal = useCallback(() => openExternalUrl(os, config.url), [config.url, os])
+
+  // ── The embedded page may ask for exactly one thing: open a session ─────────
+  // Only the page we embedded can ask (origin must match the configured URL), and
+  // the message carries no power beyond jumping to a session the app already has.
+  // Anything else — another frame, another origin, another message shape — is
+  // ignored without a word.
+  useEffect(() => {
+    if (!config.url) {
+      return undefined
+    }
+
+    const allowed = originOf(config.url)
+
+    const onMessage = (event) => {
+      if (!allowed || event.origin !== allowed) {
+        return
+      }
+
+      const data = event.data
+
+      if (!data || data.source !== MESSAGE_SOURCE || data.type !== 'open-session') {
+        return
+      }
+
+      const session = String(data.session || '').trim()
+
+      if (!session) {
+        return
+      }
+
+      const profile = String(data.profile || '').trim()
+
+      Promise.resolve(host.openSession(session, profile ? { profile } : undefined)).catch((error) => {
+        host.notify({
+          kind: 'error',
+          message: `${t('openFailed')}: ${(error && error.message) || t('openFailed')}`
+        })
+      })
+    }
+
+    window.addEventListener('message', onMessage)
+
+    return () => window.removeEventListener('message', onMessage)
+  }, [config.url, t])
 
   const save = useCallback(() => {
     const url = normalizeUrl(draft.url)

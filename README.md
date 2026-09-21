@@ -69,6 +69,18 @@ A cross-origin frame reports nothing about its own failure, so the 10-second not
 
 The pane is built from the app's own kit — `Button`, `Input`, `EmptyState`, `GlyphSpinner`, `StatusDot`, `cn`, `fmtDayTime` — rather than hand-rolled markup, so it inherits the app's variants, focus rings, dark mode, motion and reduced-motion behaviour, and keeps tracking the app's design as it changes.
 
+## The page may ask the app for one thing
+
+If the embedded page posts this message from **its own origin**, the plug-in opens that session:
+
+```js
+parent.postMessage({ source: 'hermes-fleet', type: 'open-session', session: '20260921_204954_1ec5e9', profile: 'cody' }, '*')
+```
+
+**Only the configured origin may ask** — a message from any other frame, origin or shape is ignored without a word, and the only power it carries is jumping to a session the app already has. A refusal surfaces as an error toast instead of failing silently.
+
+The fleet status page uses this for an **open session** button on rows that need you; opened in an ordinary browser instead of inside Hermes, the same button hands the OS the app's own `hermes://open/<session-id>` deep link.
+
 ## Limits (by design)
 
 - **Embedding is up to the target page.** A page sending `X-Frame-Options: DENY` or a restrictive `frame-ancestors` CSP cannot be framed — use **Open in browser** in the toolbar.

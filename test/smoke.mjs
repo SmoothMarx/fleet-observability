@@ -17,8 +17,11 @@ import {
   ROUTES_AREA,
   SIDEBAR_NAV_AREA,
   createPluginContext,
+  failOpenSessions,
   navigations,
+  notifications,
   openedExternal,
+  openedSessions,
   pluginBundles,
   resetRecorders,
   setLocale
@@ -610,6 +613,83 @@ await test('the browser row is inert, and says so, while unconfigured', async ()
 
   assert.deepEqual(openedExternal, [], 'nothing to open')
   assert.deepEqual(navigations, [])
+})
+
+// ── the page may ask for a session ───────────────────────────────────────────
+
+/** Deliver a message the way the embedded frame would. */
+async function deliver(data, origin) {
+  await act(async () => {
+    dom.window.dispatchEvent(new dom.window.MessageEvent('message', { data, origin }))
+  })
+}
+
+const OPEN_REQUEST = {
+  profile: 'cody',
+  session: '20260921_204954_1ec5e9',
+  source: 'hermes-fleet',
+  type: 'open-session'
+}
+
+await test('a session request from the configured page opens that session', async () => {
+  await withPage(CONFIGURED, async () => {
+    await deliver(OPEN_REQUEST, 'http://one:1')
+    await act(async () => {})
+
+    assert.deepEqual(openedSessions, [
+      { options: { profile: 'cody' }, session: '20260921_204954_1ec5e9' }
+    ])
+    assert.deepEqual(notifications, [], 'a clean open needs no toast')
+  })
+})
+
+await test('a session request from anywhere else is ignored', async () => {
+  await withPage(CONFIGURED, async () => {
+    // Same message, wrong origin. Any framed page can post to the app; only the
+    // one we embedded may drive it.
+    await deliver(OPEN_REQUEST, 'http://evil.example')
+    await deliver(OPEN_REQUEST, 'null')
+    await act(async () => {})
+
+    assert.deepEqual(openedSessions, [], 'another origin must not reach the app')
+  })
+})
+
+await test('messages that are not ours are ignored', async () => {
+  await withPage(CONFIGURED, async () => {
+    for (const data of [
+      { session: 'x', source: 'someone-else', type: 'open-session' },
+      { session: 'x', source: 'hermes-fleet', type: 'delete-everything' },
+      { profile: 'cody', source: 'hermes-fleet', type: 'open-session' },
+      { session: '   ', source: 'hermes-fleet', type: 'open-session' },
+      'not even an object',
+      null
+    ]) {
+      await deliver(data, 'http://one:1')
+    }
+
+    await act(async () => {})
+
+    assert.deepEqual(openedSessions, [])
+    assert.deepEqual(notifications, [], 'and they must not produce noise either')
+  })
+})
+
+await test('a session that will not open says so instead of failing silently', async () => {
+  await withPage(CONFIGURED, async () => {
+    // Inside the body on purpose: mounting resets the recorders, and the stub
+    // reads this flag when `openSession` is called.
+    failOpenSessions(true)
+
+    await deliver(OPEN_REQUEST, 'http://one:1')
+    await act(async () => {})
+
+    assert.deepEqual(openedSessions.length, 1)
+    assert.equal(notifications.length, 1, 'expected one error toast')
+    assert.equal(notifications[0].kind, 'error')
+    assert.match(notifications[0].message, /Could not open that session/)
+    assert.match(notifications[0].message, /no such session/, 'the reason is carried, not swallowed')
+  })
 })
 
 // ── i18n ─────────────────────────────────────────────────────────────────────

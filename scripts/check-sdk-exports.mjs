@@ -7,13 +7,17 @@
  * split has exactly one failure mode worth automating: the stub drifts away
  * from the app and the tests stay green while the plugin breaks.
  *
- * Two checks, in order of availability:
+ * Four checks, in order of availability:
  *
  *   1. Offline (always): every named import in plugin.js must exist in the
  *      stub, and the area constants the stub exports must still be the values
  *      the plugin registers under. Catches "the stub forgot an export".
  *   2. With a checkout (optional): every named import in plugin.js must also
  *      be exported by the app's real SDK module. Catches "the app renamed it".
+ *   3. Same run: the area constants still hold the same VALUES.
+ *   4. Same run: every `host.<verb>` the plugin calls is still a property of the
+ *      app's `host` object — `openSession` is a verb, not an import, so nothing
+ *      above would notice it going away.
  *
  * Point check 2 at a checkout with:
  *   node scripts/check-sdk-exports.mjs /path/to/hermes-agent
@@ -66,6 +70,42 @@ function stubExports(source) {
 
 const failures = []
 const notes = []
+
+/** `host.<verb>` calls in the plugin source. */
+function hostVerbsUsed(source) {
+  const names = new Set()
+
+  for (const match of source.matchAll(/\bhost\.([A-Za-z0-9_$]+)/g)) {
+    names.add(match[1])
+  }
+
+  return [...names].sort()
+}
+
+/**
+ * The region of the SDK module that starts at `export const host = {`, or null
+ * when that object cannot be located.
+ *
+ * Deliberately not a brace-matched parse: the object is hundreds of lines of
+ * nested callbacks and template strings, and counting braces across those — to
+ * report a *missing* verb, of all things — is exactly the kind of cleverness
+ * that invents drift that is not there (it reported `host.notify` as missing
+ * while `notify` sat in the object as a shorthand property).
+ */
+function hostRegionOf(sdkSource) {
+  const start = sdkSource.indexOf('export const host = {')
+
+  return start === -1 ? null : sdkSource.slice(start)
+}
+
+/**
+ * Is `name` a member of that object? Longhand (`name:` , `name(`) or shorthand
+ * (`name,`) — the app uses both. Exactly two spaces of indentation, which is how
+ * the object's own members are written; deeper would be a nested object's.
+ */
+function declaresHostVerb(region, name) {
+  return new RegExp(`^ {2}${name}\\s*[,:(]`, 'm').test(region)
+}
 
 const pluginSource = await readFile(PLUGIN, 'utf8')
 const stubSource = await readFile(STUB, 'utf8')
@@ -251,6 +291,30 @@ if (!checkout && !sdkPath) {
     notes.push(
       `check 3 compared ${Object.keys(declared).length}/${KEY_CONSTANTS.length} area constant values against the app`
     )
+
+    // ── Check 4: the host VERBS the plugin calls still exist ────────────────
+    // `host` is one import, so checks 1-3 prove only that the object is there.
+    // `host.openSession` going away would break the plugin at runtime with a
+    // TypeError in a click handler — the kind of failure no test here can catch,
+    // because the stub would keep right on exporting it.
+    const verbs = hostVerbsUsed(pluginSource)
+    const hostRegion = hostRegionOf(sdkSource)
+
+    if (!hostRegion) {
+      notes.push('check 4 skipped: `export const host = {` not found in the SDK module')
+    } else {
+      const missing = verbs.filter((verb) => !declaresHostVerb(hostRegion, verb))
+
+      for (const verb of missing) {
+        failures.push(
+          `host.${verb} is called by plugin.js but is not a member of the app's host object — likely renamed or removed`
+        )
+      }
+
+      notes.push(
+        `check 4 looked up ${verbs.length} host verb(s) in the app (${verbs.join(', ')}); ${missing.length} missing`
+      )
+    }
   }
 }
 

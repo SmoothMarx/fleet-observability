@@ -32,7 +32,30 @@ export const navigations = []
 export const host = {
   navigate(path) {
     navigations.push(path)
+  },
+  /** In-app toasts: `{ kind, message }`. */
+  notify(payload) {
+    notifications.push(payload)
+  },
+  /** Open a stored session the way the app does: `(id, { profile })`. */
+  openSession(session, options) {
+    openedSessions.push({ options, session })
+
+    return openSessionFails ? Promise.reject(new Error('no such session')) : Promise.resolve()
   }
+}
+
+/** Every `host.notify` payload. */
+export const notifications = []
+
+/** Every `host.openSession` call: `{ session, options }`. */
+export const openedSessions = []
+
+let openSessionFails = false
+
+/** Make later `openSession` calls reject, to exercise the failure path. */
+export function failOpenSessions(value = true) {
+  openSessionFails = value
 }
 
 /** Every URL handed to `os.openExternal`. */
@@ -259,6 +282,9 @@ export function pluginBundles(pluginId) {
 /** Reset every recorder between tests. */
 export function resetRecorders() {
   navigations.length = 0
+  notifications.length = 0
+  openedSessions.length = 0
+  openSessionFails = false
   openedExternal.length = 0
   bundlesByPlugin.clear()
   activeLocale = 'en'
