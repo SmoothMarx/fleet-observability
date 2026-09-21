@@ -12,6 +12,7 @@ It was written to watch a fleet of agent/project statuses on a LAN page, but not
 | Page | `ROUTES_AREA` → `/fleet` | workspace page, full-height iframe |
 | Command | `PALETTE_AREA` | ⌘K → **Fleet: Open dashboard** |
 | Command | `PALETTE_AREA` | ⌘K → **Fleet: Set dashboard URL** (the row shows the URL currently configured) |
+| Command | `PALETTE_AREA` | ⌘K → **Fleet: Open dashboard in browser** (works without visiting the page — the way out when a page refuses to be framed) |
 
 ## Requirements
 
@@ -40,17 +41,33 @@ The clone runs on your machine, so a *private* repo needs a git credential that 
 
 ## Configure
 
-First open shows a setup form. Afterwards: ⌘K → **Fleet: Set dashboard URL**, or the **Change** button in the page toolbar.
+First open shows an empty state with one action (**Set dashboard URL**); the form sits behind it. Afterwards: ⌘K → **Fleet: Set dashboard URL**, or the **Change** button in the page toolbar.
 
 Everything lives in plugin-scoped app storage (`hermes.plugin.fleet-observability.*`):
 
 | Key | Meaning | Default |
 | --- | --- | --- |
-| `dashboardUrl` | Full URL. A bare `host:port/path` is upgraded to `http://…`; other schemes are refused | — (unset ⇒ the form) |
+| `dashboardUrl` | Full URL. A bare `host:port/path` is upgraded to `http://…`; other schemes are refused | — (unset ⇒ the empty state) |
 | `label` | Sidebar row text and page title | `Fleet` |
 | `refreshSeconds` | Re-key the iframe every N seconds (`0` = off, let the page refresh itself) | `0` |
 
 `label` is read when the plugin loads, so a rename appears after **Reload desktop plugins**.
+
+## What the pane tells you
+
+The toolbar is a status line, not just buttons — an embedded page is a snapshot of an external service, so the pane says how current it is:
+
+| State | Toolbar | What you get |
+| --- | --- | --- |
+| **Loading** | muted dot, spinner over the frame, `Loading the page…` | the app's in-button working state on **Reload** (label stays put, no reflow) |
+| **Ready** | green dot, `loaded <date, time>` | the frame, and a dated value for *when* it last loaded |
+| **No response yet** | amber dot, notice bar after 10 s | honest copy (slow / unreachable / refusing to embed), **Retry**, **Open in browser** |
+
+A cross-origin frame reports nothing about its own failure, so the 10-second notice deliberately names all three likely causes rather than guessing — and never blocks: **Retry** restarts the load, and a late load clears the notice and wins.
+
+## UI
+
+The pane is built from the app's own kit — `Button`, `Input`, `EmptyState`, `GlyphSpinner`, `StatusDot`, `cn`, `fmtDayTime` — rather than hand-rolled markup, so it inherits the app's variants, focus rings, dark mode, motion and reduced-motion behaviour, and keeps tracking the app's design as it changes.
 
 ## Limits (by design)
 
@@ -89,7 +106,9 @@ npm test              # stubs the SDK + react, exercises register() and renders 
 npm run check:sdk     # only meaningful on a Hermes source checkout
 ```
 
-`npm test` needs Node ≥ 20.6 (it uses `module.register`). The SDK stub exists because the app *injects* `@hermes/plugin-sdk`, `react` and `react/jsx-runtime` into the module — in plain Node nothing resolves them, so `test/loader.mjs` maps the SDK specifier to `test/stubs/plugin-sdk.mjs`, which mirrors the real contribution shapes and the real area-constant values.
+`npm test` needs Node ≥ 20.6 (it uses `module.register`). The SDK stub exists because the app *injects* `@hermes/plugin-sdk`, `react` and `react/jsx-runtime` into the module — in plain Node nothing resolves them, so `test/loader.mjs` maps the SDK specifier to `test/stubs/plugin-sdk.mjs`, which mirrors the real contribution shapes, the real area-constant values, and the UI kit the pane renders with (each stand-in keeps the element shape the real component produces: `data-slot`, `aria-busy`, disabled-while-loading, `role="status"`, tone).
+
+`Page` is exported from `plugin.js` for that harness only (the app reads the default export): one test mounts it with a short `slowMs`, because waiting out the real 10-second "no response yet" threshold is not a test.
 
 `check:sdk` is a no-op unless pointed at a checkout. Against one, it verifies that every
 SDK import in `plugin.js` still exists in the app's real SDK module **and** that the area
@@ -108,8 +127,8 @@ HERMES_APP_ROOT=/path/to/hermes-agent npm run check:sdk
 plugin.js                     the whole plugin — runtime ESM, jsx() calls, no bundler
 test/register.mjs             module.register() bootstrap
 test/loader.mjs               maps @hermes/plugin-sdk → the stub
-test/stubs/plugin-sdk.mjs     SDK stand-in: area constants + hooks + i18n
-test/smoke.mjs                behaviour tests: contributions, URL normalising, rendering
+test/stubs/plugin-sdk.mjs     SDK stand-in: area constants, hooks, i18n, UI kit
+test/smoke.mjs                behaviour tests: contributions, URL normalising, every pane state
 scripts/check-sdk-exports.mjs drift check against a real Hermes checkout
 .github/workflows/ci.yml      npm ci + npm test + the offline SDK check on Node 20 and 22
 ```

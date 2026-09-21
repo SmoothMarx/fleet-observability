@@ -7,6 +7,12 @@
  * from the command palette. Point it at a LAN status page, Grafana, Uptime Kuma,
  * a static report — anything served over http(s).
  *
+ * UI: the app's own kit (`Button`, `Input`, `EmptyState`, `GlyphSpinner`,
+ * `StatusDot`, `cn`) rather than hand-rolled markup, so the pane inherits the
+ * app's focus rings, variants, dark mode and motion. Load state is a first-class
+ * value, not a boolean: a frame that never reports a load says so and offers a
+ * way out instead of sitting blank.
+ *
  * Runtime plugin: plain ESM, loaded uncompiled through the desktop app's blob-import
  * pipeline. `jsx()` calls only — never JSX syntax — and only `@hermes/plugin-sdk`,
  * `react` and `react/jsx-runtime` resolve. No build step, no bundler.
@@ -14,7 +20,20 @@
  * Install: Settings > Plugins > Install from Git > `<owner>/<repo>` (this repo)
  */
 
-import { host, PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA, usePluginI18n } from '@hermes/plugin-sdk'
+import {
+  Button,
+  cn,
+  EmptyState,
+  fmtDayTime,
+  GlyphSpinner,
+  host,
+  Input,
+  PALETTE_AREA,
+  ROUTES_AREA,
+  SIDEBAR_NAV_AREA,
+  StatusDot,
+  usePluginI18n
+} from '@hermes/plugin-sdk'
 import { useCallback, useEffect, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
@@ -35,14 +54,21 @@ const STORAGE_REFRESH = 'refreshSeconds'
 const DEFAULT_LABEL = 'Fleet'
 const DEFAULT_REFRESH = 0 // 0 = the embedded page handles its own refresh
 
+// How long a configured frame may stay silent before the page stops pretending
+// it is still loading. A cross-origin frame reports nothing about its own
+// failure: a blocked embed and a dead host both look like "no load event yet".
+const SLOW_MS = 10_000
+
 const LOCALES = {
   en: {
     label: 'Fleet',
     open: 'Fleet: Open dashboard',
     setUrl: 'Fleet: Set dashboard URL',
+    browser: 'Fleet: Open dashboard in browser',
     setupTitle: 'Point this at a dashboard',
     setupBody:
       'Any page served over http(s) — a status page on your network, a metrics dashboard, a static report. It is embedded as-is, so the page stays the single source of truth.',
+    emptyAction: 'Set dashboard URL',
     urlLabel: 'Dashboard URL',
     urlPlaceholder: 'http://10.0.0.5:3000/d/fleet',
     labelLabel: 'Sidebar label',
@@ -54,7 +80,13 @@ const LOCALES = {
     openExternal: 'Open in browser',
     invalidUrl: 'Enter a full URL, e.g. http://host:port/path',
     reloadHint: 'auto-reload on',
-    offline: 'not loaded yet',
+    loading: 'Loading',
+    loadingHint: 'Loading the page…',
+    loadedAt: 'loaded',
+    slowTitle: 'No response yet',
+    slowBody:
+      'This page has not finished loading. It may be slow, unreachable, or refusing to be embedded (X-Frame-Options).',
+    retry: 'Retry',
     notSet: 'not set',
     changeHint: 'rename applies after "Reload desktop plugins"',
     embedNote:
@@ -64,9 +96,11 @@ const LOCALES = {
     label: 'Frota',
     open: 'Frota: abrir painel',
     setUrl: 'Frota: definir URL do painel',
+    browser: 'Frota: abrir painel no navegador',
     setupTitle: 'Aponte isto para um painel',
     setupBody:
       'Qualquer página servida por http(s) — uma página de estado na sua rede, um painel de métricas, um relatório estático. É embutida tal como está, por isso a página continua a ser a fonte de verdade.',
+    emptyAction: 'Definir URL do painel',
     urlLabel: 'URL do painel',
     urlPlaceholder: 'http://10.0.0.5:3000/d/frota',
     labelLabel: 'Rótulo na barra lateral',
@@ -78,7 +112,13 @@ const LOCALES = {
     openExternal: 'Abrir no navegador',
     invalidUrl: 'Indique um URL completo, ex.: http://host:port/caminho',
     reloadHint: 'recarga automática ligada',
-    offline: 'ainda não carregada',
+    loading: 'A carregar',
+    loadingHint: 'A carregar a página…',
+    loadedAt: 'carregado',
+    slowTitle: 'Ainda sem resposta',
+    slowBody:
+      'Esta página ainda não acabou de carregar. Pode estar lenta, inacessível, ou a recusar ser embutida (X-Frame-Options).',
+    retry: 'Tentar de novo',
     notSet: 'não definido',
     changeHint: 'o novo nome aplica-se após "Recarregar plugins do desktop"',
     embedNote:
@@ -113,6 +153,40 @@ function readConfig(storage, fallbackLabel = DEFAULT_LABEL) {
   const refresh = Math.max(0, Math.min(86400, Math.round(Number(storage.get(STORAGE_REFRESH, DEFAULT_REFRESH)) || 0)))
 
   return { url, label, refresh }
+}
+
+// ── Opening a URL outside the pane ───────────────────────────────────────────
+// `os.openExternal` is the app's own shell open; `window.open` is the fallback
+// for hosts that do not provide one. Shared by the toolbar, the "no response
+// yet" escape hatch and the palette command.
+function openExternalUrl(os, url) {
+  if (!url) {
+    return
+  }
+
+  const fallback = () => {
+    try {
+      window.open(url, '_blank', 'noopener,noreferrer')
+    } catch {
+      /* nothing left to try */
+    }
+  }
+
+  let result = null
+
+  try {
+    result = os && os.openExternal ? os.openExternal(url) : null
+  } catch {
+    result = false
+  }
+
+  Promise.resolve(result)
+    .then((opened) => {
+      if (opened === false) {
+        fallback()
+      }
+    })
+    .catch(fallback)
 }
 
 // ── Palette -> page intent ───────────────────────────────────────────────────
@@ -168,15 +242,10 @@ function useEditRequest() {
 
 // ── UI ───────────────────────────────────────────────────────────────────────
 
-const BTN =
-  'inline-flex h-7 items-center rounded-md border border-(--ui-border) px-2.5 text-[length:var(--conversation-caption-font-size)] ' +
-  'text-(--ui-text-secondary) transition-colors hover:bg-(--ui-surface-hover) hover:text-(--ui-text-primary)'
-const INPUT =
-  'w-full rounded-md border border-(--ui-border) bg-transparent px-2 py-1.5 text-[length:var(--conversation-body-font-size)] ' +
-  'text-(--ui-text-primary) outline-none focus:border-(--ui-text-tertiary)'
 const FIELD_LABEL = 'mb-1 block text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)'
+const CAPTION = 'text-[length:var(--conversation-caption-font-size)]'
 
-function Form({ t, draft, setDraft, error, onSave, onCancel, canCancel }) {
+function Form({ t, draft, setDraft, error, onSave, onCancel }) {
   const set = (key) => (event) => setDraft({ ...draft, [key]: event.target.value })
 
   return jsxs('div', {
@@ -189,19 +258,18 @@ function Form({ t, draft, setDraft, error, onSave, onCancel, canCancel }) {
             children: t('setupTitle')
           }),
           jsx('p', {
-            className: 'mt-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
+            className: `mt-1 ${CAPTION} text-(--ui-text-tertiary)`,
             children: t('setupBody')
           })
         ]
       }),
       jsxs('div', {
         children: [
-          jsx('label', { className: FIELD_LABEL, children: t('urlLabel') }),
-          jsx('input', {
-            className: INPUT,
+          jsx('label', { className: FIELD_LABEL, htmlFor: `${ID}-url`, children: t('urlLabel') }),
+          jsx(Input, {
+            id: `${ID}-url`,
             value: draft.url,
             placeholder: t('urlPlaceholder'),
-            spellCheck: false,
             onChange: set('url'),
             onKeyDown: (event) => {
               if (event.key === 'Enter') {
@@ -217,16 +285,16 @@ function Form({ t, draft, setDraft, error, onSave, onCancel, canCancel }) {
           jsxs('div', {
             className: 'flex-1',
             children: [
-              jsx('label', { className: FIELD_LABEL, children: t('labelLabel') }),
-              jsx('input', { className: INPUT, value: draft.label, onChange: set('label') })
+              jsx('label', { className: FIELD_LABEL, htmlFor: `${ID}-label`, children: t('labelLabel') }),
+              jsx(Input, { id: `${ID}-label`, value: draft.label, onChange: set('label') })
             ]
           }),
           jsxs('div', {
             className: 'w-40',
             children: [
-              jsx('label', { className: FIELD_LABEL, children: t('refreshLabel') }),
-              jsx('input', {
-                className: INPUT,
+              jsx('label', { className: FIELD_LABEL, htmlFor: `${ID}-refresh`, children: t('refreshLabel') }),
+              jsx(Input, {
+                id: `${ID}-refresh`,
                 value: draft.refresh,
                 inputMode: 'numeric',
                 onChange: set('refresh')
@@ -236,31 +304,25 @@ function Form({ t, draft, setDraft, error, onSave, onCancel, canCancel }) {
         ]
       }),
       error
-        ? jsx('div', { className: 'text-[length:var(--conversation-caption-font-size)] text-destructive', children: error })
+        ? jsx('div', { className: `${CAPTION} text-destructive`, role: 'alert', children: error })
         : null,
       jsxs('div', {
         className: 'flex items-center gap-2',
         children: [
-          jsx('button', {
-            type: 'button',
-            className: BTN,
-            onClick: onSave,
-            children: t('save')
-          }),
-          canCancel
-            ? jsx('button', { type: 'button', className: BTN, onClick: onCancel, children: t('cancel') })
-            : null,
-          jsx('span', {
-            className: 'text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
-            children: t('embedNote')
-          })
+          jsx(Button, { onClick: onSave, children: t('save') }),
+          jsx(Button, { variant: 'ghost', onClick: onCancel, children: t('cancel') }),
+          jsx('span', { className: `${CAPTION} text-(--ui-text-tertiary)`, children: t('embedNote') })
         ]
       })
     ]
   })
 }
 
-function Page({ storage, os }) {
+/**
+ * Exported for the test harness (`test/smoke.mjs` mounts it directly to drive
+ * `slowMs`); the app only ever reads the default export below.
+ */
+export function Page({ storage, os, slowMs = SLOW_MS }) {
   const t = usePluginI18n(ID)
   const [config, setConfig] = useState(() => readConfig(storage, t('label')))
   const [editing, setEditing] = useEditRequest()
@@ -271,7 +333,10 @@ function Page({ storage, os }) {
   })
   const [error, setError] = useState('')
   const [nonce, setNonce] = useState(0)
-  const [loaded, setLoaded] = useState(false)
+  // 'loading'  the frame has not reported a load yet
+  // 'ready'    it has painted at least once (and when, so the value is dated)
+  // 'slow'     it still has not, so the page says so and offers a way out
+  const [frame, setFrame] = useState({ state: 'loading', at: null })
 
   // Entering edit mode always starts from what is stored, not from a stale draft.
   useEffect(() => {
@@ -282,7 +347,7 @@ function Page({ storage, os }) {
   }, [editing, config.url, config.label, config.refresh])
 
   const reload = useCallback(() => {
-    setLoaded(false)
+    setFrame({ state: 'loading', at: null })
     setNonce((value) => value + 1)
   }, [])
 
@@ -296,33 +361,22 @@ function Page({ storage, os }) {
     return () => clearInterval(timer)
   }, [config.url, config.refresh, reload])
 
-  const openExternal = useCallback(() => {
-    if (!config.url) {
-      return
+  // Nothing is allowed to hang silently. A cross-origin frame tells us nothing
+  // about why it never loaded, so the copy stays honest about all three causes
+  // and the escape hatch (open in browser) is right there.
+  useEffect(() => {
+    if (!config.url || editing || frame.state !== 'loading') {
+      return undefined
     }
 
-    let result = null
+    const timer = setTimeout(() => {
+      setFrame((prev) => (prev.state === 'loading' ? { state: 'slow', at: null } : prev))
+    }, slowMs)
 
-    try {
-      result = os && os.openExternal ? os.openExternal(config.url) : null
-    } catch {
-      result = false
-    }
+    return () => clearTimeout(timer)
+  }, [config.url, editing, frame.state, nonce, slowMs])
 
-    Promise.resolve(result)
-      .then((opened) => {
-        if (opened === false) {
-          window.open(config.url, '_blank', 'noopener,noreferrer')
-        }
-      })
-      .catch(() => {
-        try {
-          window.open(config.url, '_blank', 'noopener,noreferrer')
-        } catch {
-          /* nothing left to try */
-        }
-      })
-  }, [config.url, os])
+  const openExternal = useCallback(() => openExternalUrl(os, config.url), [config.url, os])
 
   const save = useCallback(() => {
     const url = normalizeUrl(draft.url)
@@ -341,7 +395,7 @@ function Page({ storage, os }) {
     setConfig({ url, label, refresh })
     setError('')
     setEditing(false)
-    setLoaded(false)
+    setFrame({ state: 'loading', at: null })
     setNonce((value) => value + 1)
   }, [draft, storage, t, setEditing])
 
@@ -350,64 +404,128 @@ function Page({ storage, os }) {
     setError('')
   }, [setEditing])
 
-  if (!config.url || editing) {
-    return jsx(Form, {
-      t,
-      draft,
-      setDraft,
-      error,
-      onSave: save,
-      onCancel: cancel,
-      canCancel: Boolean(config.url)
+  // Cold start: nothing to embed yet. One sentence, one action — not a form
+  // dropped into a page body with no explanation.
+  if (!config.url && !editing) {
+    return jsxs('div', {
+      className: 'flex h-full flex-col items-center justify-center gap-3 p-6',
+      children: [
+        jsx(EmptyState, { title: t('setupTitle'), description: t('setupBody') }),
+        jsx(Button, { onClick: () => setEditing(true), children: t('emptyAction') })
+      ]
     })
   }
 
+  if (!config.url || editing) {
+    return jsx(Form, { t, draft, setDraft, error, onSave: save, onCancel: cancel })
+  }
+
+  const tone = frame.state === 'ready' ? 'good' : frame.state === 'slow' ? 'warn' : 'muted'
+  const status =
+    frame.state === 'ready'
+      ? `${t('loadedAt')} ${fmtDayTime.format(new Date(frame.at))}`
+      : frame.state === 'slow'
+        ? t('slowTitle')
+        : t('loadingHint')
+
   return jsxs('div', {
     className: 'flex h-full min-h-0 flex-col bg-background text-foreground',
+    'data-fleet-state': frame.state,
+    'data-fleet-nonce': String(nonce),
     children: [
       jsxs('div', {
         className: 'flex items-center gap-2 border-b border-(--ui-border) px-3 py-1.5',
         children: [
+          jsx(StatusDot, { tone }),
           jsx('span', {
-            className: 'text-[length:var(--conversation-caption-font-size)] font-medium text-(--ui-text-secondary)',
+            className: `${CAPTION} shrink-0 font-medium text-(--ui-text-secondary)`,
             children: config.label
           }),
           jsx('span', {
-            className: 'truncate text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
-            children: loaded ? config.url : t('offline')
+            className: `truncate ${CAPTION} text-(--ui-text-tertiary)`,
+            title: config.url,
+            children: config.url
+          }),
+          jsx('span', {
+            className: `shrink-0 ${CAPTION} text-(--ui-text-tertiary)`,
+            'aria-live': 'polite',
+            children: status
           }),
           config.refresh > 0
             ? jsx('span', {
-                className: 'shrink-0 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)',
+                className: `shrink-0 ${CAPTION} text-(--ui-text-tertiary)`,
                 children: `${t('reloadHint')} ${config.refresh}s`
               })
             : null,
           jsx('span', { className: 'flex-1' }),
-          jsx('button', { type: 'button', className: BTN, onClick: reload, children: t('reload') }),
-          jsx('button', { type: 'button', className: BTN, onClick: openExternal, children: t('openExternal') }),
-          jsx('button', {
-            type: 'button',
-            className: BTN,
+          // `loading` keeps the button's width while the frame reloads — a label
+          // swapped for a glyph would reflow every action on the row.
+          jsx(Button, {
+            size: 'sm',
+            variant: 'ghost',
+            loading: frame.state === 'loading',
+            onClick: reload,
+            children: t('reload')
+          }),
+          jsx(Button, {
+            size: 'sm',
+            variant: 'ghost',
+            onClick: openExternal,
+            children: t('openExternal')
+          }),
+          jsx(Button, {
+            size: 'sm',
+            variant: 'ghost',
             title: t('changeHint'),
             onClick: () => setEditing(true),
             children: t('change')
           })
         ]
       }),
-      jsx(
-        'iframe',
-        {
-          src: config.url,
-          title: config.label,
-          className: 'h-full w-full flex-1 border-0 bg-white',
-          referrerPolicy: 'no-referrer',
-          onLoad: () => setLoaded(true)
-        },
-        // React's `jsx()` takes the key as its THIRD argument. Nested inside
-        // props it is dropped (and dev-warned), so the reload nonce never
-        // forced a remount — reload just re-set the same src.
-        nonce
-      )
+      frame.state === 'slow'
+        ? jsxs('div', {
+            className: `flex items-center gap-3 border-b border-(--ui-border) bg-amber-500/10 px-3 py-2 ${CAPTION}`,
+            role: 'status',
+            children: [
+              jsx('span', { className: 'shrink-0 font-medium text-(--ui-text-primary)', children: t('slowTitle') }),
+              jsx('span', { className: 'text-(--ui-text-secondary)', children: t('slowBody') }),
+              jsx('span', { className: 'flex-1' }),
+              jsx(Button, { size: 'xs', variant: 'secondary', onClick: reload, children: t('retry') }),
+              jsx(Button, { size: 'xs', variant: 'ghost', onClick: openExternal, children: t('openExternal') })
+            ]
+          })
+        : null,
+      jsxs('div', {
+        className: 'relative h-full min-h-0 flex-1',
+        children: [
+          // Sits behind the frame: visible until the page paints, then covered by
+          // it (the frame only becomes opaque once it reports a load).
+          frame.state === 'ready'
+            ? null
+            : jsxs('div', {
+                className:
+                  'pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-2 text-(--ui-text-tertiary)',
+                children: [
+                  jsx(GlyphSpinner, { ariaLabel: t('loading') }),
+                  jsx('span', { className: CAPTION, children: t('loadingHint') })
+                ]
+              }),
+          jsx(
+            'iframe',
+            {
+              src: config.url,
+              title: config.label,
+              className: cn('h-full w-full border-0', frame.state === 'ready' ? 'bg-white' : 'bg-transparent'),
+              referrerPolicy: 'no-referrer',
+              onLoad: () => setFrame({ state: 'ready', at: Date.now() })
+            },
+            // React's `jsx()` takes the key as its THIRD argument. Nested inside
+            // props it is dropped (and dev-warned), so the reload nonce never
+            // forced a remount — reload just re-set the same src.
+            nonce
+          )
+        ]
+      })
     ]
   })
 }
@@ -463,6 +581,22 @@ export default {
           requestEdit()
           host.navigate(ROUTE)
         }
+      }
+    })
+
+    // Independent of the pane: the way out when a page refuses to be embedded
+    // and the pane is showing nothing useful.
+    ctx.register({
+      id: 'browser',
+      area: PALETTE_AREA,
+      order: NAV_ORDER + 2,
+      data: {
+        id: `${ID}.browser`,
+        label: t('browser'),
+        keywords: [NAME.toLowerCase(), 'dashboard', 'browser', 'external', 'open', 'embed'],
+        detail: () => normalizeUrl(ctx.storage.get(STORAGE_URL, '')) || t('notSet'),
+        detailVariant: 'state',
+        run: () => openExternalUrl(ctx.os, normalizeUrl(ctx.storage.get(STORAGE_URL, '')))
       }
     })
   }

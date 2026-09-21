@@ -10,10 +10,15 @@
  *   i18n resolution   apps/desktop/src/i18n/plugin-i18n.ts
  *                     (active locale -> the plugin's own `en` bundle -> the key)
  *   storage namespace hermes.plugin.<plugin id>.*
+ *   UI kit            apps/desktop/src/components/ui/{button,input,empty-state,
+ *                     glyph-spinner}.tsx, components/status-dot.tsx, lib/time.ts
+ *                     (stand-ins: same element shape + attributes, no Tailwind)
  *
  * `scripts/check-sdk-exports.mjs` re-checks these values against a Hermes
  * checkout when one is available.
  */
+
+import { jsx, jsxs } from 'react/jsx-runtime'
 
 export const PALETTE_AREA = 'palette'
 export const ROUTES_AREA = 'routes'
@@ -92,6 +97,83 @@ export function translatePlugin(pluginId, locale, key, args = []) {
 export function usePluginI18n(pluginId) {
   return (key, ...args) => translatePlugin(pluginId, activeLocale, key, args)
 }
+
+// ── UI kit ──────────────────────────────────────────────────────────────────
+// The app exports real Tailwind + radix components; under plain Node they can
+// only be stood in for behaviourally. Each stand-in keeps the element shape and
+// the attributes the real one produces (`data-slot`, `aria-busy`,
+// disabled-while-loading, tone, role="status"), so a test that queries the DOM
+// is asserting the contract the plugin depends on — not something the stub
+// invented. Prop *names* come from the app source; `check-sdk-exports.mjs`
+// re-checks the names against a checkout.
+
+export function cn(...parts) {
+  return parts.filter(Boolean).join(' ')
+}
+
+export function Button({
+  variant = 'default',
+  size = 'default',
+  loading = false,
+  className,
+  children,
+  disabled,
+  ...props
+}) {
+  return jsx('button', {
+    ...props,
+    className: cn('button', className),
+    'data-slot': 'button',
+    'data-variant': variant,
+    'data-size': size,
+    'aria-busy': loading || undefined,
+    disabled: Boolean(disabled) || loading,
+    children: loading
+      ? jsxs('span', {
+          children: [children, jsx('span', { 'aria-hidden': 'true', 'data-slot': 'button-spinner' })]
+        })
+      : children
+  })
+}
+
+export function Input({ className, containerClassName, prefix, suffix, size, ...props }) {
+  return jsx('input', { ...props, className: cn('input', className), 'data-slot': 'input' })
+}
+
+export function EmptyState({ title, description, className }) {
+  return jsxs('div', {
+    className: cn('empty-state', className),
+    'data-slot': 'empty-state',
+    children: [jsx('div', { children: title }), description ? jsx('div', { children: description }) : null]
+  })
+}
+
+export function GlyphSpinner({ ariaLabel = 'Loading', className, paused = false, spinner = 'braille' }) {
+  return jsx('span', {
+    role: 'status',
+    'aria-label': ariaLabel,
+    className: cn('glyph-spinner', className),
+    'data-slot': 'glyph-spinner'
+  })
+}
+
+export function StatusDot({ className, tone, ...props }) {
+  return jsx('span', {
+    ...props,
+    'aria-hidden': 'true',
+    'data-tone': tone,
+    'data-slot': 'status-dot',
+    className: cn('status-dot', className)
+  })
+}
+
+/** Shared Intl instance, like the app's — created once, not per render. */
+export const fmtDayTime = new Intl.DateTimeFormat('en-GB', {
+  day: 'numeric',
+  hour: 'numeric',
+  minute: '2-digit',
+  month: 'short'
+})
 
 // ── storage ─────────────────────────────────────────────────────────────────
 

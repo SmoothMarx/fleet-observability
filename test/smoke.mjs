@@ -10,6 +10,7 @@
 
 import assert from 'node:assert/strict'
 import { JSDOM } from 'jsdom'
+import { jsx } from 'react/jsx-runtime'
 
 import {
   PALETTE_AREA,
@@ -47,7 +48,11 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true
 
 const { act } = await import('react')
 const { createRoot } = await import('react-dom/client')
-const plugin = (await import('../plugin.js')).default
+const pluginModule = await import('../plugin.js')
+const plugin = pluginModule.default
+// `Page` is exported for this harness: one test mounts it directly to drive a
+// short `slowMs`, because waiting out the real 10-second default is not a test.
+const { Page } = pluginModule
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -99,6 +104,39 @@ function text(container) {
   return container.textContent || ''
 }
 
+/** Cold start is an empty state; the form is one click behind it. */
+async function openForm(container) {
+  if (container.querySelectorAll('input').length === 0) {
+    await click(button(container, 'Set dashboard URL'))
+  }
+}
+
+/** The page's root while a dashboard is configured — carries the load state. */
+function pageRoot(container) {
+  return container.querySelector('[data-fleet-state]')
+}
+
+/** Load state as the toolbar and the spinner read it. */
+function loadState(container) {
+  return pageRoot(container)?.getAttribute('data-fleet-state')
+}
+
+const CONFIGURED = { dashboardUrl: 'http://one:1/', label: 'Ops', refreshSeconds: 0 }
+
+/** Report a frame load the way the browser does. */
+async function reportLoad(container) {
+  await act(async () => {
+    container.querySelector('iframe').dispatchEvent(new dom.window.Event('load'))
+  })
+}
+
+/** Let real time pass inside `act`, so the plugin's timers stay accountable. */
+async function wait(ms) {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, ms))
+  })
+}
+
 /** Register the plugin against a fresh context, without mounting anything. */
 function setup(initialStorage = {}, locale = 'en') {
   resetRecorders()
@@ -124,17 +162,25 @@ function withTimeout(promise, ms, label) {
   ]).finally(() => clearTimeout(timer))
 }
 
-/** Register, mount the page contribution, hand it to `body`, always unmount. */
-async function withPage(initialStorage, body) {
-  const { ctx, storage, contributions } = setup(initialStorage)
+/**
+ * Register, mount the page contribution, hand it to `body`, always unmount.
+ * `options.slowMs` mounts `Page` directly with a shorter "no response yet"
+ * threshold — the only prop the harness ever overrides.
+ */
+async function withPage(initialStorage, body, options = {}) {
+  const { ctx, storage, contributions } = setup(initialStorage, options.locale ?? 'en')
   const page = contributions.find((entry) => entry.area === ROUTES_AREA)
   const container = dom.window.document.createElement('div')
 
   dom.window.document.body.appendChild(container)
 
   const root = createRoot(container)
+  const element = options.slowMs
+    ? jsx(Page, { os: ctx.os, slowMs: options.slowMs, storage })
+    : page.render()
+
   await act(async () => {
-    root.render(page.render())
+    root.render(element)
   })
 
   let failure = null
@@ -211,11 +257,11 @@ await test('exports an id/name pair and a register function', () => {
   assert.equal(typeof plugin.register, 'function')
 })
 
-await test('registers one sidebar row, one page and two palette commands', () => {
+await test('registers one sidebar row, one page and three palette commands', () => {
   const { contributions } = setup()
   const areas = contributions.map((entry) => entry.area).sort()
 
-  assert.deepEqual(areas, [PALETTE_AREA, PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA].sort())
+  assert.deepEqual(areas, [PALETTE_AREA, PALETTE_AREA, PALETTE_AREA, ROUTES_AREA, SIDEBAR_NAV_AREA].sort())
 })
 
 await test('the sidebar row points at the route with a codicon', () => {
@@ -238,13 +284,15 @@ await test('the page contribution carries the route and a render function', () =
 
 await test('palette commands are namespaced by plugin id and ordered after the row', () => {
   const { contributions } = setup()
-  const [open, configure] = contributions.filter((entry) => entry.area === PALETTE_AREA)
+  const [open, configure, browser] = contributions.filter((entry) => entry.area === PALETTE_AREA)
 
   assert.equal(open.data.id, `${PLUGIN_ID}.open`)
   assert.equal(configure.data.id, `${PLUGIN_ID}.configure`)
-  assert.deepEqual([open.order, configure.order], [NAV_ORDER, NAV_ORDER + 1])
+  assert.equal(browser.data.id, `${PLUGIN_ID}.browser`)
+  assert.deepEqual([open.order, configure.order, browser.order], [NAV_ORDER, NAV_ORDER + 1, NAV_ORDER + 2])
   assert.equal(typeof open.data.run, 'function')
   assert.equal(typeof configure.data.run, 'function')
+  assert.equal(typeof browser.data.run, 'function')
 })
 
 await test('a stored label wins over the locale default', () => {
@@ -265,16 +313,44 @@ await test('palette labels and keywords follow the plugin name, not a hard-coded
 
 // ── the page ─────────────────────────────────────────────────────────────────
 
-await test('an unconfigured page renders the setup form, not an iframe', async () => {
+await test('an unconfigured page offers one way forward instead of an iframe', async () => {
   await withPage({}, async ({ container }) => {
-    assert.ok(text(container).includes('Point this at a dashboard'))
-    assert.equal(container.querySelectorAll('input').length, 3)
+    assert.ok(text(container).includes('Point this at a dashboard'), 'expected the setup copy')
+    assert.ok(container.querySelector('[data-slot="empty-state"]'), 'expected the app\'s empty state')
+    assert.equal(container.querySelectorAll('button').length, 1, 'one action, not a toolbar')
+    assert.equal(button(container, 'Set dashboard URL').getAttribute('data-slot'), 'button')
     assert.ok(container.querySelector('iframe') === null)
+
+    // The empty state is a screen, not a dead end: the one action opens the form.
+    await click(button(container, 'Set dashboard URL'))
+
+    assert.equal(container.querySelectorAll('input').length, 3)
+    assert.equal(container.querySelector('[data-slot="empty-state"]'), null)
+  })
+})
+
+await test('the setup form uses the app\'s inputs, labelled for screen readers', async () => {
+  await withPage({}, async ({ container }) => {
+    await openForm(container)
+
+    const fields = [...container.querySelectorAll('input')]
+
+    assert.ok(
+      fields.every((field) => field.getAttribute('data-slot') === 'input'),
+      'expected the app\'s Input, not hand-rolled markup'
+    )
+
+    for (const id of ['url', 'label', 'refresh']) {
+      assert.ok(container.querySelector(`label[for="${PLUGIN_ID}-${id}"]`), `field "${id}" has no label`)
+      assert.ok(container.querySelector(`#${PLUGIN_ID}-${id}`), `field "${id}" has no control`)
+    }
   })
 })
 
 await test('a bare host:port is normalised to http:// and persisted on save', async () => {
   await withPage({}, async ({ container, storage }) => {
+    await openForm(container)
+
     const fields = inputs(container)
 
     await type(fields.url, '10.0.0.5:9000/fleet?range=1h')
@@ -298,6 +374,7 @@ await test('a bare host:port is normalised to http:// and persisted on save', as
 
 await test('a non-http scheme is refused and nothing is written', async () => {
   await withPage({}, async ({ container, storage }) => {
+    await openForm(container)
     await type(inputs(container).url, 'ftp://example.com/x')
     await click(button(container, 'Save'))
 
@@ -309,6 +386,7 @@ await test('a non-http scheme is refused and nothing is written', async () => {
 
 await test('javascript: is refused too', async () => {
   await withPage({}, async ({ container, storage }) => {
+    await openForm(container)
     await type(inputs(container).url, 'javascript:alert(1)')
     await click(button(container, 'Save'))
 
@@ -361,7 +439,9 @@ await test('Cancel leaves stored settings untouched', async () => {
 })
 
 await test('Reload remounts the iframe without changing its src', async () => {
-  await withPage({ dashboardUrl: 'http://one:1/', label: 'Ops', refreshSeconds: 0 }, async ({ container }) => {
+  await withPage(CONFIGURED, async ({ container }) => {
+    await reportLoad(container)
+
     const before = container.querySelector('iframe')
 
     await click(button(container, 'Reload'))
@@ -369,6 +449,7 @@ await test('Reload remounts the iframe without changing its src', async () => {
     const after = container.querySelector('iframe')
     assert.notEqual(after, before, 'expected a fresh iframe element')
     assert.equal(after.getAttribute('src'), 'http://one:1/')
+    assert.equal(loadState(container), 'loading', 'a reload is a fresh load, not a stale label')
   })
 })
 
@@ -380,6 +461,68 @@ await test('Open in browser goes through os.openExternal, not window.open', asyn
     assert.deepEqual(openedExternal, ['http://one:1/'])
   })
 })
+
+// ── load state ───────────────────────────────────────────────────────────────
+
+await test('a configured page reports loading, then a dated ready state', async () => {
+  await withPage(CONFIGURED, async ({ container }) => {
+    assert.equal(loadState(container), 'loading')
+    assert.ok(container.querySelector('[role="status"]'), 'expected the spinner while loading')
+    assert.ok(text(container).includes('Loading the page…'))
+    assert.equal(container.querySelector('[data-slot="status-dot"]').getAttribute('data-tone'), 'muted')
+
+    await reportLoad(container)
+
+    assert.equal(loadState(container), 'ready')
+    assert.equal(container.querySelector('[role="status"]'), null, 'the spinner must go once the page is up')
+    assert.equal(container.querySelector('[data-slot="status-dot"]').getAttribute('data-tone'), 'good')
+    // Dated, not just "loaded": an embedded page is a snapshot of an external
+    // service, so the pane says *when* it last heard from it.
+    assert.match(text(container), /loaded\s+\d/, `expected a load time, got: ${text(container)}`)
+  })
+})
+
+await test('a frame that never reports a load is called out, and recovers on a late load', async () => {
+  await withPage(
+    CONFIGURED,
+    async ({ container }) => {
+      assert.equal(loadState(container), 'loading')
+
+      await wait(60)
+
+      assert.equal(loadState(container), 'slow')
+      assert.ok(text(container).includes('No response yet'), 'expected the no-response notice')
+      assert.ok(text(container).includes('X-Frame-Options'), 'the copy must name the likeliest cause')
+      assert.equal(container.querySelector('[data-slot="status-dot"]').getAttribute('data-tone'), 'warn')
+
+      // Retry puts the frame back to work rather than leaving it stuck.
+      await click(button(container, 'Retry'))
+      assert.equal(loadState(container), 'loading')
+
+      // A slow page that eventually loads is believed, and the notice goes.
+      await reportLoad(container)
+
+      assert.equal(loadState(container), 'ready')
+      assert.ok(!text(container).includes('No response yet'), 'the notice must clear on a real load')
+    },
+    { slowMs: 40 }
+  )
+})
+
+await test('the Reload action carries the app\'s in-button loading state', async () => {
+  await withPage(CONFIGURED, async ({ container }) => {
+    await reportLoad(container)
+
+    assert.equal(button(container, 'Reload').getAttribute('aria-busy'), null)
+
+    await click(button(container, 'Reload'))
+
+    assert.equal(loadState(container), 'loading')
+    assert.equal(button(container, 'Reload').getAttribute('aria-busy'), 'true')
+    assert.equal(button(container, 'Reload').disabled, true, 'a working action must not be clickable again')
+  })
+})
+
 
 // ── palette -> page ──────────────────────────────────────────────────────────
 
@@ -439,6 +582,36 @@ await test('the open row navigates to the route', async () => {
   assert.deepEqual(navigations, [ROUTE])
 })
 
+await test('the browser row opens the URL without moving the app', async () => {
+  const { contributions } = setup(CONFIGURED)
+  const browser = contributions.find((entry) => entry.area === PALETTE_AREA && entry.data.id.endsWith('.browser'))
+
+  assert.equal(browser.data.detail(), 'http://one:1/')
+
+  await act(async () => {
+    browser.data.run()
+  })
+
+  await act(async () => {})
+
+  assert.deepEqual(openedExternal, ['http://one:1/'])
+  assert.deepEqual(navigations, [], 'opening a browser must not navigate inside the app')
+})
+
+await test('the browser row is inert, and says so, while unconfigured', async () => {
+  const { contributions } = setup()
+  const browser = contributions.find((entry) => entry.area === PALETTE_AREA && entry.data.id.endsWith('.browser'))
+
+  assert.equal(browser.data.detail(), 'not set')
+
+  await act(async () => {
+    browser.data.run()
+  })
+
+  assert.deepEqual(openedExternal, [], 'nothing to open')
+  assert.deepEqual(navigations, [])
+})
+
 // ── i18n ─────────────────────────────────────────────────────────────────────
 
 await test('en and pt bundles cover exactly the same keys', () => {
@@ -464,10 +637,33 @@ await test('pt locale drives every string the plugin shows, and unknown keys fal
 
 await test('every UI string the plugin renders comes from the bundle', async () => {
   await withPage({}, async ({ container }) => {
+    // Screen 1: the cold-start empty state.
+    for (const literal of ['Point this at a dashboard', 'Set dashboard URL']) {
+      assert.ok(text(container).includes(literal), `missing "${literal}"`)
+    }
+
+    // Screen 2: the form behind it.
+    await openForm(container)
+
     for (const literal of ['Point this at a dashboard', 'Dashboard URL', 'Save', 'Sidebar label']) {
       assert.ok(text(container).includes(literal), `missing "${literal}"`)
     }
   })
+})
+
+await test('the pt bundle covers the states, not just the form', async () => {
+  await withPage(
+    { dashboardUrl: 'http://one:1/', label: 'Frota', refreshSeconds: 0 },
+    async ({ container }) => {
+      assert.ok(text(container).includes('A carregar a página…'), 'expected the pt loading copy')
+
+      await wait(60)
+
+      assert.ok(text(container).includes('Ainda sem resposta'), 'expected the pt no-response notice')
+      assert.ok(text(container).includes('X-Frame-Options'), 'the cause is named in pt too')
+    },
+    { locale: 'pt', slowMs: 40 }
+  )
 })
 
 // ── summary ──────────────────────────────────────────────────────────────────
