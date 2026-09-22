@@ -24,6 +24,7 @@ import {
   openedSessions,
   pluginBundles,
   resetRecorders,
+  setGatewayConnections,
   setLocale
 } from '@hermes/plugin-sdk'
 
@@ -55,7 +56,7 @@ const pluginModule = await import('../plugin.js')
 const plugin = pluginModule.default
 // `Page` is exported for this harness: one test mounts it directly to drive a
 // short `slowMs`, because waiting out the real 10-second default is not a test.
-const { Page } = pluginModule
+const { Page, gatewayHostOf } = pluginModule
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -172,6 +173,18 @@ function withTimeout(promise, ms, label) {
  */
 async function withPage(initialStorage, body, options = {}) {
   const { ctx, storage, contributions } = setup(initialStorage, options.locale ?? 'en')
+
+  // The app's own gateway settings, as the pane reads them for its address.
+  // No `gateway` option = an older build with no registry, i.e. the manual path
+  // the rest of this suite asserts; passing one means the registry answers
+  // (unless the test says `unavailable`), and the pane derives its address.
+  const gateway = options.gateway ?? { unavailable: true }
+
+  setGatewayConnections(gateway.rows ?? [], {
+    active: gateway.active ?? null,
+    unavailable: gateway.unavailable ?? false
+  })
+
   const page = contributions.find((entry) => entry.area === ROUTES_AREA)
   const container = dom.window.document.createElement('div')
 
@@ -184,6 +197,15 @@ async function withPage(initialStorage, body, options = {}) {
 
   await act(async () => {
     root.render(element)
+  })
+
+  // The pane resolves its address asynchronously (it asks the app for the
+  // gateway settings). Without this flush the DOM would still be showing the
+  // "reading…" state while a test asserts, and React would warn that the update
+  // landed outside act(). A macrotask, not just a microtask: the promise chain
+  // behind the read is more than one tick deep.
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20))
   })
 
   let failure = null
@@ -320,7 +342,7 @@ await test('an unconfigured page offers one way forward instead of an iframe', a
   await withPage({}, async ({ container }) => {
     assert.ok(text(container).includes('Point this at a dashboard'), 'expected the setup copy')
     assert.ok(container.querySelector('[data-slot="empty-state"]'), 'expected the app\'s empty state')
-    assert.equal(container.querySelectorAll('button').length, 1, 'one action, not a toolbar')
+    assert.equal(container.querySelectorAll('button').length, 2, 'the way forward, plus a retry')
     assert.equal(button(container, 'Set dashboard URL').getAttribute('data-slot'), 'button')
     assert.ok(container.querySelector('iframe') === null)
 
@@ -364,7 +386,10 @@ await test('a bare host:port is normalised to http:// and persisted on save', as
     assert.deepEqual(storage.snapshot(), {
       dashboardUrl: 'http://10.0.0.5:9000/fleet?range=1h',
       label: 'Ops',
-      refreshSeconds: 60
+      refreshSeconds: 60,
+      // A typed address is marked as typed: that is what stops detection from
+      // repointing it at the app's own gateway on the next load.
+      urlSource: 'manual'
     })
 
     const frame = container.querySelector('iframe')
@@ -744,6 +769,163 @@ await test('the pt bundle covers the states, not just the form', async () => {
     },
     { locale: 'pt', slowMs: 40 }
   )
+})
+
+// ── the address comes from the app, not from the user ────────────────────────
+// The pane's first job is to find out where the page is. It asks the app's own
+// gateway settings (`host.connections()`), so the normal path has nothing to
+// type; the manual form is the fallback for a build that cannot be asked.
+
+const REMOTE = { id: 'studio', label: 'Studio', remote: { url: 'http://10.0.4.15:9119' } }
+
+await test('a fresh pane derives the page from the app\'s own gateway settings', async () => {
+  await withPage(
+    {},
+    async ({ container, storage }) => {
+      assert.equal(container.querySelector('input'), null, 'nothing to type on the normal path')
+
+      const frame = container.querySelector('iframe')
+
+      assert.ok(frame, 'expected the page to be framed')
+      assert.equal(frame.getAttribute('src'), 'http://10.0.4.15:8766/fleet-status.html')
+      assert.equal(loadState(container), 'loading')
+
+      const snapshot = storage.snapshot()
+
+      assert.equal(snapshot.dashboardUrl, 'http://10.0.4.15:8766/fleet-status.html')
+      assert.equal(snapshot.urlSource, 'gateway')
+      assert.ok(Number(snapshot.detectedAt) > 0, 'a derived address is dated')
+
+      assert.ok(
+        container.querySelector('[data-fleet-source="gateway"]'),
+        'the toolbar says where it came from'
+      )
+    },
+    { gateway: { rows: [REMOTE], active: 'studio' } }
+  )
+})
+
+await test('the active connection is the one read, not just the primary', async () => {
+  await withPage(
+    {},
+    async ({ container }) => {
+      assert.equal(
+        container.querySelector('iframe').getAttribute('src'),
+        'http://10.0.4.15:8766/fleet-status.html'
+      )
+    },
+    {
+      gateway: {
+        rows: [
+          { id: 'other', label: 'Other', primary: true, remote: { url: 'http://10.0.0.9:9119' } },
+          REMOTE
+        ],
+        active: 'studio'
+      }
+    }
+  )
+})
+
+await test('an app with no registered connection derives this machine', async () => {
+  await withPage(
+    {},
+    async ({ container, storage }) => {
+      assert.equal(
+        container.querySelector('iframe').getAttribute('src'),
+        'http://127.0.0.1:8766/fleet-status.html'
+      )
+      assert.equal(storage.snapshot().urlSource, 'gateway')
+    },
+    { gateway: { rows: [] } }
+  )
+})
+
+await test('an ssh connection derives that host', async () => {
+  await withPage(
+    {},
+    async ({ container }) => {
+      assert.equal(
+        container.querySelector('iframe').getAttribute('src'),
+        'http://build-host:8766/fleet-status.html'
+      )
+    },
+    { gateway: { rows: [{ id: 'build', label: 'Build', remote: { mode: 'ssh', host: 'deploy@build-host' } }] } }
+  )
+})
+
+await test('a hand-typed address is an override detection never takes back', async () => {
+  await withPage(
+    { dashboardUrl: 'http://typed:9/ops', label: 'Ops', refreshSeconds: 0, urlSource: 'manual' },
+    async ({ container, storage }) => {
+      assert.equal(container.querySelector('iframe').getAttribute('src'), 'http://typed:9/ops')
+      assert.equal(storage.snapshot().dashboardUrl, 'http://typed:9/ops')
+      assert.equal(container.querySelector('[data-fleet-source]'), null, 'not claimed as derived')
+    },
+    { gateway: { rows: [REMOTE], active: 'studio' } }
+  )
+})
+
+await test('an address stored before this version counts as typed', async () => {
+  // The upgrade trap: storage from an earlier version has a URL and no source.
+  // Treating that as derived would silently repoint a page the user chose.
+  await withPage(
+    { dashboardUrl: 'http://legacy:9/x', label: 'Ops', refreshSeconds: 0 },
+    async ({ container, storage }) => {
+      assert.equal(container.querySelector('iframe').getAttribute('src'), 'http://legacy:9/x')
+      assert.equal(storage.snapshot().dashboardUrl, 'http://legacy:9/x')
+    },
+    { gateway: { rows: [REMOTE], active: 'studio' } }
+  )
+})
+
+await test('a re-homed app re-derives instead of framing the old host', async () => {
+  await withPage(
+    { dashboardUrl: 'http://127.0.0.1:8766/fleet-status.html', urlSource: 'gateway', detectedAt: 1 },
+    async ({ container }) => {
+      assert.equal(
+        container.querySelector('iframe').getAttribute('src'),
+        'http://10.0.4.15:8766/fleet-status.html',
+        'the derived address follows the app, it is not trusted from storage'
+      )
+    },
+    { gateway: { rows: [REMOTE], active: 'studio' } }
+  )
+})
+
+await test('without a readable gateway the pane says so instead of guessing', async () => {
+  await withPage({}, async ({ container, storage }) => {
+    assert.equal(container.querySelector('iframe'), null, 'no frame for a host nobody named')
+    assert.ok(text(container).includes('Couldn\u2019t read this app\u2019s gateway settings'), 'the reason is named')
+    assert.equal(loadState(container), 'unconfigured')
+    assert.equal(storage.snapshot().dashboardUrl, undefined, 'nothing invented')
+
+    // Retry, not a dead end: the registry answering a moment later is enough.
+    setGatewayConnections([REMOTE], { active: 'studio' })
+    await click(button(container, 'Retry'))
+
+    assert.equal(container.querySelector('iframe').getAttribute('src'), 'http://10.0.4.15:8766/fleet-status.html')
+  })
+})
+
+await test('Use the app\'s gateway page drops the override and re-derives', async () => {
+  await withPage(
+    { dashboardUrl: 'http://typed:9/ops', label: 'Ops', refreshSeconds: 0, urlSource: 'manual' },
+    async ({ container, storage }) => {
+      await click(button(container, 'Change'))
+      await click(button(container, 'Use the app\u2019s gateway page'))
+
+      assert.equal(container.querySelector('iframe').getAttribute('src'), 'http://10.0.4.15:8766/fleet-status.html')
+      assert.equal(storage.snapshot().urlSource, 'gateway')
+    },
+    { gateway: { rows: [REMOTE], active: 'studio' } }
+  )
+})
+
+await test('gatewayHostOf reads url, ssh host and local without inventing one', () => {
+  assert.equal(gatewayHostOf([REMOTE], 'studio').host, '10.0.4.15')
+  assert.equal(gatewayHostOf([{ id: 's', remote: { mode: 'ssh', host: 'user@box' } }], null).host, 'box')
+  assert.equal(gatewayHostOf([], null).host, '127.0.0.1')
+  assert.equal(gatewayHostOf([{ id: 'c', remote: { mode: 'cloud' } }], 'c').host, '', 'no address to derive')
 })
 
 // ── summary ──────────────────────────────────────────────────────────────────

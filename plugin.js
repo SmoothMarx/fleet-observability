@@ -7,6 +7,12 @@
  * from the command palette. Point it at a LAN status page, Grafana, Uptime Kuma,
  * a static report — anything served over http(s).
  *
+ * Nothing is typed by default. On load the pane asks the APP where its gateway is
+ * (`host.connections()` + `host.activeConnectionId()` — the very settings the
+ * window is running on) and derives the page from that host, so the common case
+ * is zero configuration. A hand-typed URL is stored as an explicit override and
+ * detection never overwrites it.
+ *
  * The page may also ask the app for one thing: a message
  * `{ source: 'hermes-fleet', type: 'open-session', session, profile }` from the
  * embedded origin makes the app open that session (a "open session" button on
@@ -39,7 +45,7 @@ import {
   StatusDot,
   usePluginI18n
 } from '@hermes/plugin-sdk'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 // ── Make it your own: change NAME, ROUTE and the locale bundles below. ────────
@@ -59,6 +65,16 @@ const STORAGE_REFRESH = 'refreshSeconds'
 const DEFAULT_LABEL = 'Fleet'
 const DEFAULT_REFRESH = 0 // 0 = the embedded page handles its own refresh
 
+// Where the app's own gateway settings point, when nobody has typed a URL: the
+// fleet bridge serves this page on the same machine as the agent (default port
+// of `serve-bridge.py`). A typed URL replaces it; nothing is ever guessed twice.
+const PAGE_PORT = 8766
+const PAGE_PATH = '/fleet-status.html'
+/** `'gateway'` = derived from the app's connection, `'manual'` = typed by the user. */
+const STORAGE_SOURCE = 'urlSource'
+/** When the derived URL was last read from the app's gateway (epoch ms). */
+const STORAGE_DETECTED_AT = 'detectedAt'
+
 // How long a configured frame may stay silent before the page stops pretending
 // it is still loading. A cross-origin frame reports nothing about its own
 // failure: a blocked embed and a dead host both look like "no load event yet".
@@ -76,7 +92,12 @@ const LOCALES = {
     browser: 'Fleet: Open dashboard in browser',
     setupTitle: 'Point this at a dashboard',
     setupBody:
-      'Any page served over http(s) — a status page on your network, a metrics dashboard, a static report. It is embedded as-is, so the page stays the single source of truth.',
+      'Any page served over http(s) — a status page on your network, a metrics dashboard, a static report. It is embedded as-is, so the page stays the single source of truth. Normally you do not have to fill this in: the address comes from this app’s own gateway settings.',
+    detecting: 'Reading this app’s gateway settings…',
+    detectFailed: 'Couldn’t read this app’s gateway settings',
+    detectFailedBody: 'This Desktop build reported no connection, so the address has to be typed once.',
+    fromGateway: 'from the app’s gateway',
+    useGateway: 'Use the app’s gateway page',
     emptyAction: 'Set dashboard URL',
     urlLabel: 'Dashboard URL',
     urlPlaceholder: 'http://10.0.0.5:3000/d/fleet',
@@ -109,7 +130,12 @@ const LOCALES = {
     browser: 'Frota: abrir painel no navegador',
     setupTitle: 'Aponte isto para um painel',
     setupBody:
-      'Qualquer página servida por http(s) — uma página de estado na sua rede, um painel de métricas, um relatório estático. É embutida tal como está, por isso a página continua a ser a fonte de verdade.',
+      'Qualquer página servida por http(s) — uma página de estado na sua rede, um painel de métricas, um relatório estático. É embutida tal como está, por isso a página continua a ser a fonte de verdade. Normalmente não precisa de preencher isto: o endereço vem das definições da gateway desta app.',
+    detecting: 'A ler as definições da gateway desta app…',
+    detectFailed: 'Não foi possível ler as definições da gateway desta app',
+    detectFailedBody: 'Esta versão da app não reportou nenhuma ligação, por isso o endereço tem de ser escrito uma vez.',
+    fromGateway: 'da gateway da app',
+    useGateway: 'Usar a página da gateway da app',
     emptyAction: 'Definir URL do painel',
     urlLabel: 'URL do painel',
     urlPlaceholder: 'http://10.0.0.5:3000/d/frota',
@@ -167,12 +193,96 @@ function originOf(url) {
   }
 }
 
+// ── Where the page is (the user never has to paste it) ───────────────────────
+// This app already knows which machine its agent runs on — that is what its
+// connection settings ARE. The page is served from that same machine, so derive
+// it. A typed URL stays an explicit override; detection never overwrites one.
+
+/**
+ * Host of the machine the app's gateway runs on, from the app's own rows
+ * (`host.connections()`). Remote/cloud entries carry `remote.url`, ssh entries
+ * `remote.host`, and a local backend means the app's own machine.
+ * Exported for the test harness; the pane only uses `gatewayPage` below.
+ */
+export function gatewayHostOf(rows, activeId) {
+  const list = Array.isArray(rows) ? rows.filter((row) => row && typeof row === 'object') : []
+
+  // No registered connections at all: this app is running a backend of its own
+  // on this machine, so the page is here too. Derive, don't ask.
+  if (!list.length) {
+    return { host: '127.0.0.1', row: null }
+  }
+
+  const row =
+    (activeId ? list.find((entry) => entry.id === activeId) : null) ||
+    list.find((entry) => entry.primary) ||
+    (list.length === 1 ? list[0] : null)
+
+  if (!row) {
+    return { host: '', row: null }
+  }
+
+  const remote = row.remote && typeof row.remote === 'object' ? row.remote : {}
+  const url = String(remote.url || '').trim()
+
+  if (url) {
+    try {
+      return { host: new URL(url).hostname, row }
+    } catch {
+      /* not a URL — an ssh entry names its host instead (below) */
+    }
+  }
+
+  const sshHost = String(remote.host || '').trim()
+
+  if (sshHost) {
+    return { host: sshHost.replace(/^[^@]*@/, ''), row }
+  }
+
+  // No remote at all: the backend is on this same machine.
+  return { host: !remote.mode || remote.mode === 'local' ? '127.0.0.1' : '', row }
+}
+
+/**
+ * Ask the app for its gateway settings and build the page URL from them.
+ *
+ * Rejects — never guesses — when this build has no registry or no usable
+ * connection: the pane then says so and offers the manual form, which is
+ * honest, where framing the wrong host would look like a broken page.
+ */
+async function gatewayPage() {
+  if (!host || typeof host.connections !== 'function') {
+    throw new Error('no connection registry')
+  }
+
+  const rows = await host.connections()
+  const activeId = typeof host.activeConnectionId === 'function' ? host.activeConnectionId() : null
+  const { host: name, row } = gatewayHostOf(rows, activeId)
+
+  if (!name) {
+    throw new Error('no gateway connection')
+  }
+
+  return {
+    detectedAt: Date.now(),
+    host: name,
+    label: String((row && row.label) || '').trim(),
+    url: `http://${name}:${PAGE_PORT}${PAGE_PATH}`
+  }
+}
+
 function readConfig(storage, fallbackLabel = DEFAULT_LABEL) {
   const url = normalizeUrl(storage.get(STORAGE_URL, ''))
   const label = String(storage.get(STORAGE_LABEL, '') || '').trim() || fallbackLabel
   const refresh = Math.max(0, Math.min(86400, Math.round(Number(storage.get(STORAGE_REFRESH, DEFAULT_REFRESH)) || 0)))
+  const marked = storage.get(STORAGE_SOURCE, '')
+  // 'manual' — typed here. 'gateway' — derived, and therefore re-derived on every
+  // load. 'legacy' — a URL stored before this version knew about sources: an
+  // address the user chose, so it counts as typed and is never overwritten.
+  const source = marked === 'manual' || marked === 'gateway' ? marked : url ? 'legacy' : ''
+  const detectedAt = Number(storage.get(STORAGE_DETECTED_AT, 0)) || 0
 
-  return { url, label, refresh }
+  return { url, label, refresh, source, detectedAt }
 }
 
 // ── Opening a URL outside the pane ───────────────────────────────────────────
@@ -265,7 +375,7 @@ function useEditRequest() {
 const FIELD_LABEL = 'mb-1 block text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)'
 const CAPTION = 'text-[length:var(--conversation-caption-font-size)]'
 
-function Form({ t, draft, setDraft, error, onSave, onCancel }) {
+function Form({ t, draft, setDraft, error, onSave, onCancel, onUseGateway }) {
   const set = (key) => (event) => setDraft({ ...draft, [key]: event.target.value })
 
   return jsxs('div', {
@@ -331,6 +441,9 @@ function Form({ t, draft, setDraft, error, onSave, onCancel }) {
         children: [
           jsx(Button, { onClick: onSave, children: t('save') }),
           jsx(Button, { variant: 'ghost', onClick: onCancel, children: t('cancel') }),
+          onUseGateway
+            ? jsx(Button, { variant: 'ghost', onClick: onUseGateway, children: t('useGateway') })
+            : null,
           jsx('span', { className: `${CAPTION} text-(--ui-text-tertiary)`, children: t('embedNote') })
         ]
       })
@@ -345,6 +458,11 @@ function Form({ t, draft, setDraft, error, onSave, onCancel }) {
 export function Page({ storage, os, slowMs = SLOW_MS }) {
   const t = usePluginI18n(ID)
   const [config, setConfig] = useState(() => readConfig(storage, t('label')))
+  // Detection is the default path: a pane with no URL says what it is doing
+  // instead of asking for something the app already knows.
+  const [detecting, setDetecting] = useState(() => !config.url)
+  const [detectError, setDetectError] = useState('')
+  const [detectTick, setDetectTick] = useState(0)
   const [editing, setEditing] = useEditRequest()
   const [draft, setDraft] = useState(() => {
     const initial = readConfig(storage, t('label'))
@@ -357,6 +475,73 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
   // 'ready'    it has painted at least once (and when, so the value is dated)
   // 'slow'     it still has not, so the page says so and offers a way out
   const [frame, setFrame] = useState({ state: 'loading', at: null })
+
+  const detect = useCallback(() => setDetectTick((value) => value + 1), [])
+
+  // The translator is not guaranteed to be a stable function identity, and this
+  // effect writes state: depending on `t` directly re-ran it every render and
+  // looped forever (the harness caught it as a hang, not as a red test). Read
+  // the current one through a ref instead.
+  const tRef = useRef(t)
+
+  tRef.current = t
+
+  // Ask the app where its gateway is, then point the pane at that machine.
+  //
+  // A hand-typed URL is an explicit override: detection leaves it alone. Anything
+  // derived IS re-derived on every load rather than trusted from storage, so a
+  // re-homed app (new gateway, new machine) follows along instead of framing a
+  // stale host — and the value carries the moment it was read.
+  useEffect(() => {
+    const stored = readConfig(storage, tRef.current('label'))
+
+    // A typed address is an explicit override — and so is one stored by an
+    // earlier version, which had nothing else it could be. Detection fills a
+    // gap; it never takes an address back.
+    if (stored.source === 'manual' || (stored.url && stored.source !== 'gateway')) {
+      return undefined
+    }
+
+    let cancelled = false
+
+    setDetecting(true)
+
+    gatewayPage()
+      .then((page) => {
+        if (cancelled) {
+          return
+        }
+
+        const current = readConfig(storage, tRef.current('label'))
+
+        storage.set(STORAGE_URL, page.url)
+        storage.set(STORAGE_SOURCE, 'gateway')
+        storage.set(STORAGE_DETECTED_AT, page.detectedAt)
+        setConfig({
+          detectedAt: page.detectedAt,
+          label: current.label,
+          refresh: current.refresh,
+          source: 'gateway',
+          url: page.url
+        })
+        setDetecting(false)
+        setDetectError('')
+        setFrame({ state: 'loading', at: null })
+        setNonce((value) => value + 1)
+      })
+      .catch((failure) => {
+        if (cancelled) {
+          return
+        }
+
+        setDetecting(false)
+        setDetectError(String((failure && failure.message) || failure || 'unknown'))
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [storage, detectTick])
 
   // Entering edit mode always starts from what is stored, not from a stale draft.
   useEffect(() => {
@@ -456,32 +641,73 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
     storage.set(STORAGE_URL, url)
     storage.set(STORAGE_LABEL, label)
     storage.set(STORAGE_REFRESH, refresh)
-    setConfig({ url, label, refresh })
+    // Typed by hand = an explicit override. Detection must not take it back.
+    storage.set(STORAGE_SOURCE, 'manual')
+    storage.remove(STORAGE_DETECTED_AT)
+    setConfig({ detectedAt: 0, label, refresh, source: 'manual', url })
+    setDetectError('')
     setError('')
     setEditing(false)
     setFrame({ state: 'loading', at: null })
     setNonce((value) => value + 1)
   }, [draft, storage, t, setEditing])
 
+  // Drop a hand-typed override and go back to whatever the app's gateway says.
+  const useGateway = useCallback(() => {
+    storage.remove(STORAGE_URL)
+    storage.remove(STORAGE_SOURCE)
+    storage.remove(STORAGE_DETECTED_AT)
+    setEditing(false)
+    setError('')
+    setDraft((current) => ({ ...current, url: '' }))
+    detect()
+  }, [storage, setEditing, detect])
+
   const cancel = useCallback(() => {
     setEditing(false)
     setError('')
   }, [setEditing])
 
-  // Cold start: nothing to embed yet. One sentence, one action — not a form
-  // dropped into a page body with no explanation.
+  // Cold start. Detection comes first — the address is normally the app's own
+  // business, not the user's — so the pane says what it is reading rather than
+  // opening with a form. The form appears only when the app cannot be asked, or
+  // when the user asked to type one.
+  if (!config.url && !editing && detecting) {
+    return jsxs('div', {
+      className: 'flex h-full flex-col items-center justify-center gap-2 p-6 text-(--ui-text-tertiary)',
+      'data-fleet-state': 'detecting',
+      role: 'status',
+      children: [
+        jsx(GlyphSpinner, { ariaLabel: t('detecting') }),
+        jsx('span', { className: CAPTION, children: t('detecting') })
+      ]
+    })
+  }
+
   if (!config.url && !editing) {
     return jsxs('div', {
       className: 'flex h-full flex-col items-center justify-center gap-3 p-6',
+      'data-fleet-state': 'unconfigured',
       children: [
-        jsx(EmptyState, { title: t('setupTitle'), description: t('setupBody') }),
-        jsx(Button, { onClick: () => setEditing(true), children: t('emptyAction') })
+        jsx(EmptyState, {
+          title: t('setupTitle'),
+          description: detectError
+            ? `${t('detectFailed')} — ${t('detectFailedBody')} (${detectError})`
+            : t('setupBody')
+        }),
+        jsxs('div', {
+          className: 'flex items-center gap-2',
+          children: [
+            jsx(Button, { onClick: () => setEditing(true), children: t('emptyAction') }),
+            jsx(Button, { variant: 'ghost', onClick: detect, children: t('retry') })
+          ]
+        })
       ]
     })
   }
 
   if (!config.url || editing) {
-    return jsx(Form, { t, draft, setDraft, error, onSave: save, onCancel: cancel })
+    return jsx(Form, { t, draft, setDraft, error, onSave: save, onCancel: cancel, onUseGateway: useGateway })
   }
 
   const tone = frame.state === 'ready' ? 'good' : frame.state === 'slow' ? 'warn' : 'muted'
@@ -510,6 +736,18 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
             title: config.url,
             children: config.url
           }),
+          // Where the address came from, dated when it was read from the app —
+          // a derived value must never look like a setting the user has seen.
+          config.source === 'gateway'
+            ? jsx('span', {
+                className: `shrink-0 ${CAPTION} text-(--ui-text-tertiary)`,
+                'data-fleet-source': 'gateway',
+                title: config.detectedAt
+                  ? `${t('fromGateway')} · ${fmtDayTime.format(new Date(config.detectedAt))}`
+                  : t('fromGateway'),
+                children: t('fromGateway')
+              })
+            : null,
           jsx('span', {
             className: `shrink-0 ${CAPTION} text-(--ui-text-tertiary)`,
             'aria-live': 'polite',

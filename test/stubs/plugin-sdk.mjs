@@ -26,10 +26,37 @@ export const SIDEBAR_NAV_AREA = 'sidebar.nav'
 
 // ── host ─────────────────────────────────────────────────────────────────────
 
+/** The app's gateway settings, as `host.connections()` would report them. */
+const connectionRegistry = { active: null, rows: [], unavailable: false }
+
+/**
+ * Stand in for the app's own connection registry — the gateway settings a
+ * plug-in reads instead of asking the user. `rows` are sanitized records
+ * (`{ id, label, remote: { url | host } }`, `primary` added by the SDK);
+ * `unavailable` rejects the way a Desktop build without the registry does.
+ */
+export function setGatewayConnections(rows, { active = null, unavailable = false } = {}) {
+  connectionRegistry.rows = Array.isArray(rows) ? rows : []
+  connectionRegistry.active = active
+  connectionRegistry.unavailable = unavailable
+}
+
 /** Every path passed to `host.navigate`, newest last. */
 export const navigations = []
 
 export const host = {
+  /** The registered connections the SDK exposes (token bytes never included). */
+  connections() {
+    if (connectionRegistry.unavailable) {
+      return Promise.reject(new Error('This Desktop build has no connection registry. Update Hermes Desktop.'))
+    }
+
+    return Promise.resolve(connectionRegistry.rows.map((row) => ({ ...row })))
+  },
+  /** Registry id of the connection the window is running on, null for local. */
+  activeConnectionId() {
+    return connectionRegistry.active
+  },
   navigate(path) {
     navigations.push(path)
   },
@@ -217,7 +244,8 @@ export function createStorage(initial = {}) {
       writes.push({ key, value })
       map.set(key, value)
     },
-    delete(key) {
+    /** The app's own name for it (`PluginStorage.remove`). */
+    remove(key) {
       map.delete(key)
     },
     snapshot() {
@@ -288,4 +316,7 @@ export function resetRecorders() {
   openedExternal.length = 0
   bundlesByPlugin.clear()
   activeLocale = 'en'
+  connectionRegistry.active = null
+  connectionRegistry.rows = []
+  connectionRegistry.unavailable = false
 }

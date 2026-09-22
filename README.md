@@ -4,6 +4,8 @@ A **Hermes Desktop plugin** that embeds *any* HTTP dashboard as a full page in t
 
 It was written to watch a fleet of agent/project statuses on a LAN page, but nothing about that page is baked in: point it at Grafana, Uptime Kuma, a static status report, a metrics endpoint — anything served over `http(s)`. The embedded page stays the single source of truth; the plugin only supplies chrome (sidebar row, toolbar, palette commands) around it.
 
+**Nothing to type.** On open the pane asks the *app* where its gateway is (`host.connections()` — the very settings the window is running on) and frames the page on that same machine. A hand-typed URL is an explicit override, and detection never takes it back.
+
 ## What it contributes
 
 | Contribution | Area | Where it shows up |
@@ -35,21 +37,39 @@ It was written to watch a fleet of agent/project statuses on a LAN page, but not
    (The installer also accepts a `#subdir` suffix and tree URLs for a plugin that lives in a subdirectory of a bigger repo.)
 3. Confirm. The app installs `plugin.js` into `<hermes home>/desktop-plugins/fleet-observability/plugin.js` — `%USERPROFILE%\.hermes\desktop-plugins\…` on Windows.
 4. The **Fleet** row appears under Kanban. If not, run **Reload desktop plugins** from ⌘K.
-5. Open the row and give it a URL.
+5. Open the row. It finds its address by itself (see below); there is nothing to fill in.
 
 The clone runs on your machine, so a *private* repo needs a git credential that can read it; a public repo needs none. No build step: the app executes `plugin.js` as-is.
 
-## Configure
+## Where the address comes from
 
-First open shows an empty state with one action (**Set dashboard URL**); the form sits behind it. Afterwards: ⌘K → **Fleet: Set dashboard URL**, or the **Change** button in the page toolbar.
+The app already knows which machine its agent runs on — that is what its connection settings are. The pane reads them and frames `http://<that host>:8766/fleet-status.html`, so a fresh install needs no configuration at all:
 
-Everything lives in plugin-scoped app storage (`hermes.plugin.fleet-observability.*`):
+| App connection | Derived host |
+| --- | --- |
+| Remote / cloud (`remote.url`) | the host in that URL |
+| SSH (`remote.host`) | that host |
+| Local backend, or nothing registered | `127.0.0.1` |
+
+Properties worth keeping if you fork this:
+
+- **Derived values are re-read on every open**, not trusted from storage — re-home the app to another gateway and the pane follows instead of framing the old host. The toolbar says `from the app's gateway` and carries the moment it was read.
+- **A typed address wins, permanently.** Saving the form marks it `urlSource: 'manual'`, and an address stored by an *earlier* version (a URL with no source) counts as typed too: detection fills a gap, it never takes an address back.
+- **No registry is not a guess.** If the app cannot report its connections (an older Desktop build), the pane says so, offers **Retry**, and shows the manual form rather than framing a host nobody named.
+
+`PAGE_PORT` (8766) and `PAGE_PATH` (`/fleet-status.html`) are constants at the top of `plugin.js` — the default port of the `serve-bridge.py` that serves the fleet page next to the agent.
+
+## Configure (the override)
+
+Normally there is nothing to configure. When you do need a different page: ⌘K → **Fleet: Set dashboard URL**, or the **Change** button in the page toolbar. **Use the app's gateway page** in that form drops the override and goes back to the derived address. Everything lives in plugin-scoped app storage (`hermes.plugin.fleet-observability.*`):
 
 | Key | Meaning | Default |
 | --- | --- | --- |
-| `dashboardUrl` | Full URL. A bare `host:port/path` is upgraded to `http://…`; other schemes are refused | — (unset ⇒ the empty state) |
+| `dashboardUrl` | Full URL. A bare `host:port/path` is upgraded to `http://…`; other schemes are refused | derived from the app's gateway |
 | `label` | Sidebar row text and page title | `Fleet` |
 | `refreshSeconds` | Re-key the iframe every N seconds (`0` = off, let the page refresh itself) | `0` |
+| `urlSource` | `'gateway'` (derived, re-read each open) or `'manual'` (typed, never overwritten) | — (unset + a URL ⇒ `'legacy'`: treated as typed) |
+| `detectedAt` | Epoch ms of the last derivation — the toolbar's tooltip shows it | — |
 
 `label` is read when the plugin loads, so a rename appears after **Reload desktop plugins**.
 
@@ -86,6 +106,7 @@ The fleet status page uses this for an **open session** button on rows that need
 - **Embedding is up to the target page.** A page sending `X-Frame-Options: DENY` or a restrictive `frame-ancestors` CSP cannot be framed — use **Open in browser** in the toolbar.
 - **`http(s)` only.** Other schemes are refused rather than handed to the iframe.
 - **No auth injection.** The iframe is not sandboxed and carries the app session for that origin, but the plugin does not log in for you: point it at something the app machine can already reach (a LAN page, or one with its own session/cookie).
+- **A sign-in form inside the frame will not stick.** An embedded page gets the *webview's* cookie jar, not the app's, and a `SameSite`-gated session cookie is not sent in a cross-site frame — so a page that requires a login can look like it "just refreshes" no matter how often you sign in. Use **Open in browser** for those; the fleet page this plugin is built for needs no session at all.
 - **Read-only.** The plugin never writes to the dashboard, and it adds only navigation chrome — there is never a second renderer of the same data to keep in sync.
 
 ## Make it your own
