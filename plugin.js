@@ -22,8 +22,10 @@
  *
  * The page may also ask the app for one thing: a message
  * `{ source: 'hermes-fleet', type: 'open-session', session, profile }` from the
- * embedded origin makes the app open that session (a "open session" button on
- * rows that need you). Only the configured origin may ask.
+ * embedded origin makes the app open that session (the page puts an "open
+ * session" button on every row that carries one). Only the configured origin
+ * may ask, and a refusal surfaces as an error toast instead of failing
+ * silently.
  *
  * UI: the app's own kit (`Button`, `Input`, `GlyphSpinner`, `StatusDot`, `cn`)
  * rather than hand-rolled markup, so the pane inherits the

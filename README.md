@@ -101,7 +101,7 @@ parent.postMessage({ source: 'hermes-fleet', type: 'open-session', session: '202
 
 **Only the configured origin may ask** — a message from any other frame, origin or shape is ignored without a word, and the only power it carries is jumping to a session the app already has. A refusal surfaces as an error toast instead of failing silently.
 
-The fleet status page uses this for an **open session** button on rows that need you; opened in an ordinary browser instead of inside Hermes, the same button hands the OS the app's own `hermes://open/<session-id>` deep link.
+The fleet status page uses this for an **open session** button on every row that carries a session — a chat knows itself, a delegated run names the session that owns it; rows with nothing to open get no button at all. Opened in an ordinary browser instead of inside Hermes, the same button hands the OS the app's own `hermes://open/<session-id>` deep link.
 
 ## Limits (by design)
 
