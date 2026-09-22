@@ -39,3 +39,6 @@ jobs:
 
       - name: SDK drift check
         run: npm run check:sdk
+
+      - name: Reporting-skill drift check
+        run: npm run check:skill

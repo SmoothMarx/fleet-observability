@@ -103,6 +103,41 @@ parent.postMessage({ source: 'hermes-fleet', type: 'open-session', session: '202
 
 The fleet status page uses this for an **open session** button on every row that carries a session — a chat knows itself, a delegated run names the session that owns it; rows with nothing to open get no button at all. Opened in an ordinary browser instead of inside Hermes, the same button hands the OS the app's own `hermes://open/<session-id>` deep link.
 
+## Reporting back: how a session tells the fleet what it is doing
+
+A page can only show what something reports. A session's existence, age and exit are
+visible from the box; **what the work is doing, how far along it is, and when it will be
+done are not observable** — they have to be authored. The contract for that ships with the
+plug-in, in `skills/fleet-reporting/`:
+
+* `skills/fleet-reporting/SKILL.md` — the skill to install in a profile, so sessions there
+  know to report. (Its description is kept inside the 60-char skill-index budget by check 1
+  below — a longer one is truncated to `...` and stops routing.)
+* `skills/fleet-reporting/scripts/fleet_evt.py` — the writer. It appends one JSON line per
+  call to `~/.hermes/fleet/events.jsonl`; the collector folds that file into page rows,
+  newest value per field wins.
+
+```
+python3 fleet_evt.py start <id> --label "…" --doing "…" --eta 15 --total 100 --unit files
+python3 fleet_evt.py phase <id> --doing "now doing X" --done 40
+python3 fleet_evt.py note  <id> --doing "blocked on the approval prompt"
+python3 fleet_evt.py end   <id> --outcome done|failed|abandoned
+```
+
+`start` fixes the clock the *Elapsed* column counts from and the `--eta` that *ETA guess*
+is compared against, so an optimistic estimate shows up as drift instead of hiding. Install
+it where the sessions actually live — per profile, and `~/.hermes/skills/` for the default
+one:
+
+```
+mkdir -p ~/.hermes/profiles/<profile>/skills/devops/fleet-reporting
+cp -r skills/fleet-reporting/* ~/.hermes/profiles/<profile>/skills/devops/fleet-reporting/
+```
+
+`npm run check:skill` keeps the two halves in step: every verb and flag the skill documents
+must exist in the writer, and every flag the writer accepts must be documented. Without it a
+session follows instructions that no longer run, which looks exactly like a broken page.
+
 ## Limits (by design)
 
 - **Embedding is up to the target page.** A page sending `X-Frame-Options: DENY` or a restrictive `frame-ancestors` CSP cannot be framed — use **Open in browser** in the toolbar.
