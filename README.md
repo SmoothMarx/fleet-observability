@@ -4,7 +4,7 @@ A **Hermes Desktop plugin** that embeds *any* HTTP dashboard as a full page in t
 
 It was written to watch a fleet of agent/project statuses on a LAN page, but nothing about that page is baked in: point it at Grafana, Uptime Kuma, a static status report, a metrics endpoint — anything served over `http(s)`. The embedded page stays the single source of truth; the plugin only supplies chrome (sidebar row, toolbar, palette commands) around it.
 
-**Nothing to type.** On open the pane asks the *app* where its gateway is (`host.connections()` — the very settings the window is running on) and frames the page on that same machine. A hand-typed URL is an explicit override, and detection never takes it back.
+**Nothing to type, nothing in the way.** The page is the view from the first frame — the address you saved, or on a fresh install the default page on this machine — and the pane refines it from the *app's own gateway settings* (`host.connections()`) in the background. A hand-typed URL is an explicit override and is never taken back; the one exception is the app's own dashboard, which can only ever show a sign-in inside a page, so the pane steps around it and says so.
 
 ## What it contributes
 
@@ -37,7 +37,7 @@ It was written to watch a fleet of agent/project statuses on a LAN page, but not
    (The installer also accepts a `#subdir` suffix and tree URLs for a plugin that lives in a subdirectory of a bigger repo.)
 3. Confirm. The app installs `plugin.js` into `<hermes home>/desktop-plugins/fleet-observability/plugin.js` — `%USERPROFILE%\.hermes\desktop-plugins\…` on Windows.
 4. The **Fleet** row appears under Kanban. If not, run **Reload desktop plugins** from ⌘K.
-5. Open the row. It finds its address by itself (see below); there is nothing to fill in.
+5. Open the row. The page appears immediately; it finds its address by itself (see below), so there is nothing to fill in.
 
 The clone runs on your machine, so a *private* repo needs a git credential that can read it; a public repo needs none. No build step: the app executes `plugin.js` as-is.
 
@@ -55,7 +55,8 @@ Properties worth keeping if you fork this:
 
 - **Derived values are re-read on every open**, not trusted from storage — re-home the app to another gateway and the pane follows instead of framing the old host. The toolbar says `from the app's gateway` and carries the moment it was read.
 - **A typed address wins, permanently.** Saving the form marks it `urlSource: 'manual'`, and an address stored by an *earlier* version (a URL with no source) counts as typed too: detection fills a gap, it never takes an address back.
-- **No registry is not a guess.** If the app cannot report its connections (an older Desktop build), the pane says so, offers **Retry**, and shows the manual form rather than framing a host nobody named.
+- **No registry is not a guess.** If the app cannot report its connections (an older Desktop build), the pane still frames the default page on this machine and says why, with **Retry** and **Change** right there — it never blocks on a form.
+- **The app's own dashboard is the one address that is stepped around.** A page inside the app carries no session for it (its own cookie jar, and `SameSite`-gated cookies are not sent in a cross-site frame), so it can only ever show a sign-in form. Saved on that origin, the pane derives instead and says so.
 
 `PAGE_PORT` (8766) and `PAGE_PATH` (`/fleet-status.html`) are constants at the top of `plugin.js` — the default port of the `serve-bridge.py` that serves the fleet page next to the agent.
 
@@ -80,6 +81,7 @@ The toolbar is a status line, not just buttons — an embedded page is a snapsho
 | State | Toolbar | What you get |
 | --- | --- | --- |
 | **Loading** | muted dot, spinner over the frame, `Loading the page…` | the app's in-button working state on **Reload** (label stays put, no reflow) |
+| **Nothing saved** | muted dot + `Couldn't read this app's gateway settings…` notice | the default page on this machine, with **Retry** and **Change** |
 | **Ready** | green dot, `loaded <date, time>` | the frame, and a dated value for *when* it last loaded |
 | **No response yet** | amber dot, notice bar after 10 s | honest copy (slow / unreachable / refusing to embed), **Retry**, **Open in browser** |
 

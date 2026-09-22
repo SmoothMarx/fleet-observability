@@ -111,7 +111,9 @@ function text(container) {
 /** Cold start is an empty state; the form is one click behind it. */
 async function openForm(container) {
   if (container.querySelectorAll('input').length === 0) {
-    await click(button(container, 'Set dashboard URL'))
+    // The page is the entrance now, not the form: the toolbar's Change button
+    // (same as the palette command) opens it.
+    await click(button(container, 'Change'))
   }
 }
 
@@ -338,19 +340,23 @@ await test('palette labels and keywords follow the plugin name, not a hard-coded
 
 // ── the page ─────────────────────────────────────────────────────────────────
 
-await test('an unconfigured page offers one way forward instead of an iframe', async () => {
-  await withPage({}, async ({ container }) => {
-    assert.ok(text(container).includes('Point this at a dashboard'), 'expected the setup copy')
-    assert.ok(container.querySelector('[data-slot="empty-state"]'), 'expected the app\'s empty state')
-    assert.equal(container.querySelectorAll('button').length, 2, 'the way forward, plus a retry')
-    assert.equal(button(container, 'Set dashboard URL').getAttribute('data-slot'), 'button')
-    assert.ok(container.querySelector('iframe') === null)
+await test('a pane with nothing saved frames the page straight away', async () => {
+  await withPage({}, async ({ container, storage }) => {
+    const frame = container.querySelector('iframe')
 
-    // The empty state is a screen, not a dead end: the one action opens the form.
-    await click(button(container, 'Set dashboard URL'))
+    assert.ok(frame, 'the page is the entrance — no form, no waiting screen')
+    assert.equal(frame.getAttribute('src'), 'http://127.0.0.1:8766/fleet-status.html')
+    assert.equal(container.querySelectorAll('input').length, 0)
+
+    // This harness build reports no registry, so the pane says why this is the
+    // address it used instead of pretending it derived it.
+    assert.ok(container.querySelector('[data-fleet-notice="no-registry"]'), 'the reason is stated')
+    assert.equal(storage.snapshot().dashboardUrl, undefined, 'nothing invented in storage')
+
+    // And the form is one click away, not in the way.
+    await openForm(container)
 
     assert.equal(container.querySelectorAll('input').length, 3)
-    assert.equal(container.querySelector('[data-slot="empty-state"]'), null)
   })
 })
 
@@ -742,8 +748,8 @@ await test('pt locale drives every string the plugin shows, and unknown keys fal
 
 await test('every UI string the plugin renders comes from the bundle', async () => {
   await withPage({}, async ({ container }) => {
-    // Screen 1: the cold-start empty state.
-    for (const literal of ['Point this at a dashboard', 'Set dashboard URL']) {
+    // Screen 1: the page, with the reason the default address was used.
+    for (const literal of ['Loading the page…', 'Couldn\u2019t read this app\u2019s gateway settings']) {
       assert.ok(text(container).includes(literal), `missing "${literal}"`)
     }
 
@@ -892,11 +898,15 @@ await test('a re-homed app re-derives instead of framing the old host', async ()
   )
 })
 
-await test('without a readable gateway the pane says so instead of guessing', async () => {
+await test('without a readable gateway the pane still shows a page, and says why', async () => {
   await withPage({}, async ({ container, storage }) => {
-    assert.equal(container.querySelector('iframe'), null, 'no frame for a host nobody named')
-    assert.ok(text(container).includes('Couldn\u2019t read this app\u2019s gateway settings'), 'the reason is named')
-    assert.equal(loadState(container), 'unconfigured')
+    assert.equal(
+      container.querySelector('iframe').getAttribute('src'),
+      'http://127.0.0.1:8766/fleet-status.html',
+      'the default page, not a form'
+    )
+    assert.ok(container.querySelector('[data-fleet-notice="no-registry"]'), 'the reason is named')
+    assert.ok(text(container).includes('Couldn\u2019t read this app\u2019s gateway settings'), 'in plain words')
     assert.equal(storage.snapshot().dashboardUrl, undefined, 'nothing invented')
 
     // Retry, not a dead end: the registry answering a moment later is enough.
@@ -904,7 +914,32 @@ await test('without a readable gateway the pane says so instead of guessing', as
     await click(button(container, 'Retry'))
 
     assert.equal(container.querySelector('iframe').getAttribute('src'), 'http://10.0.4.15:8766/fleet-status.html')
+    assert.equal(container.querySelector('[data-fleet-notice]'), null, 'the notice clears')
   })
+})
+
+// The one saved address that can never work inside a frame: the app's own
+// dashboard. It has no session for the frame (own cookie jar, SameSite-gated
+// cookies), so the pane would sit on its sign-in form forever.
+await test('an address saved as the app\u2019s own dashboard is never framed', async () => {
+  await withPage(
+    {
+      dashboardUrl: 'http://10.0.4.15:9119/',
+      label: 'Ops',
+      refreshSeconds: 0,
+      urlSource: 'manual'
+    },
+    async ({ container, storage }) => {
+      assert.equal(
+        container.querySelector('iframe').getAttribute('src'),
+        'http://10.0.4.15:8766/fleet-status.html',
+        'the page on the gateway machine, not the dashboard'
+      )
+      assert.ok(container.querySelector('[data-fleet-notice="own-gateway"]'), 'and it says so')
+      assert.equal(storage.snapshot().urlSource, 'gateway', 'the pane is not left pointing at a dead end')
+    },
+    { gateway: { rows: [{ id: 'studio', label: 'Studio', remote: { url: 'http://10.0.4.15:9119' } }], active: 'studio' } }
+  )
 })
 
 await test('Use the app\'s gateway page drops the override and re-derives', async () => {

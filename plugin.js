@@ -7,19 +7,26 @@
  * from the command palette. Point it at a LAN status page, Grafana, Uptime Kuma,
  * a static report — anything served over http(s).
  *
- * Nothing is typed by default. On load the pane asks the APP where its gateway is
- * (`host.connections()` + `host.activeConnectionId()` — the very settings the
- * window is running on) and derives the page from that host, so the common case
- * is zero configuration. A hand-typed URL is stored as an explicit override and
- * detection never overwrites it.
+ * The page is the view, immediately: a saved address is framed on the spot and a
+ * fresh install frames the default page on this machine — never a form, never a
+ * waiting screen. In the background the pane asks the APP where its gateway is
+ * (`host.connections()` + `host.activeConnectionId()` — the settings the window
+ * is running on) and re-points itself at that host a moment later, so the common
+ * case is zero configuration and two addresses are never needed.
+ *
+ * A hand-typed URL is stored as an explicit override and detection leaves it
+ * alone — with one exception: the app's *own* dashboard. A page inside the app
+ * has no session for it (its own cookie jar, SameSite-gated cookies), so that
+ * address can only ever show a sign-in form; the pane says so and shows the page
+ * on the gateway machine instead.
  *
  * The page may also ask the app for one thing: a message
  * `{ source: 'hermes-fleet', type: 'open-session', session, profile }` from the
  * embedded origin makes the app open that session (a "open session" button on
  * rows that need you). Only the configured origin may ask.
  *
- * UI: the app's own kit (`Button`, `Input`, `EmptyState`, `GlyphSpinner`,
- * `StatusDot`, `cn`) rather than hand-rolled markup, so the pane inherits the
+ * UI: the app's own kit (`Button`, `Input`, `GlyphSpinner`, `StatusDot`, `cn`)
+ * rather than hand-rolled markup, so the pane inherits the
  * app's focus rings, variants, dark mode and motion. Load state is a first-class
  * value, not a boolean: a frame that never reports a load says so and offers a
  * way out instead of sitting blank.
@@ -34,7 +41,6 @@
 import {
   Button,
   cn,
-  EmptyState,
   fmtDayTime,
   GlyphSpinner,
   host,
@@ -93,9 +99,10 @@ const LOCALES = {
     setupTitle: 'Point this at a dashboard',
     setupBody:
       'Any page served over http(s) — a status page on your network, a metrics dashboard, a static report. It is embedded as-is, so the page stays the single source of truth. Normally you do not have to fill this in: the address comes from this app’s own gateway settings.',
-    detecting: 'Reading this app’s gateway settings…',
-    detectFailed: 'Couldn’t read this app’s gateway settings',
-    detectFailedBody: 'This Desktop build reported no connection, so the address has to be typed once.',
+    ownGatewayNotice:
+      'That address is this app’s own dashboard. A page inside the app has no session for it, so it can only ever show its sign-in. Showing the page on the gateway machine instead.',
+    noRegistryNotice:
+      'Couldn’t read this app’s gateway settings, so this is the default address. Change it if the page lives elsewhere.',
     fromGateway: 'from the app’s gateway',
     useGateway: 'Use the app’s gateway page',
     emptyAction: 'Set dashboard URL',
@@ -131,9 +138,10 @@ const LOCALES = {
     setupTitle: 'Aponte isto para um painel',
     setupBody:
       'Qualquer página servida por http(s) — uma página de estado na sua rede, um painel de métricas, um relatório estático. É embutida tal como está, por isso a página continua a ser a fonte de verdade. Normalmente não precisa de preencher isto: o endereço vem das definições da gateway desta app.',
-    detecting: 'A ler as definições da gateway desta app…',
-    detectFailed: 'Não foi possível ler as definições da gateway desta app',
-    detectFailedBody: 'Esta versão da app não reportou nenhuma ligação, por isso o endereço tem de ser escrito uma vez.',
+    ownGatewayNotice:
+      'Esse endereço é o próprio painel desta app. Uma página dentro da app não tem sessão para ele, por isso só pode mostrar o início de sessão. A mostrar a página na máquina da gateway.',
+    noRegistryNotice:
+      'Não foi possível ler as definições da gateway desta app, por isso este é o endereço predefinido. Altere-o se a página estiver noutro sítio.',
     fromGateway: 'da gateway da app',
     useGateway: 'Usar a página da gateway da app',
     emptyAction: 'Definir URL do painel',
@@ -244,6 +252,50 @@ export function gatewayHostOf(rows, activeId) {
 }
 
 /**
+ * Origin of the app's *own* gateway — the dashboard the window is talking to.
+ * A page framed on that origin can never hold a session (its own cookie jar,
+ * SameSite-gated cookies), so it is the one address that is guaranteed to sit
+ * on a sign-in form forever. Empty when the app reports nothing.
+ */
+export function gatewayOriginOf(rows, activeId) {
+  const list = Array.isArray(rows) ? rows.filter((row) => row && typeof row === 'object') : []
+  const row =
+    (activeId ? list.find((entry) => entry.id === activeId) : null) ||
+    list.find((entry) => entry.primary) ||
+    (list.length === 1 ? list[0] : null)
+  const remote = row && row.remote && typeof row.remote === 'object' ? row.remote : {}
+  const url = String(remote.url || '').trim()
+
+  if (!url) {
+    return ''
+  }
+
+  try {
+    return new URL(url).origin
+  } catch {
+    return ''
+  }
+}
+
+/** Is this address the app's own dashboard (the dead end described above)? */
+export function isOwnGatewayUrl(url, gatewayOrigin) {
+  if (!url || !gatewayOrigin) {
+    return false
+  }
+
+  try {
+    return new URL(url).origin === gatewayOrigin
+  } catch {
+    return false
+  }
+}
+
+/** Where the page lives when the app cannot be asked: this machine. */
+function defaultPageUrl() {
+  return `http://127.0.0.1:${PAGE_PORT}${PAGE_PATH}`
+}
+
+/**
  * Ask the app for its gateway settings and build the page URL from them.
  *
  * Rejects — never guesses — when this build has no registry or no usable
@@ -265,6 +317,7 @@ async function gatewayPage() {
 
   return {
     detectedAt: Date.now(),
+    gatewayOrigin: gatewayOriginOf(rows, activeId),
     host: name,
     label: String((row && row.label) || '').trim(),
     url: `http://${name}:${PAGE_PORT}${PAGE_PATH}`
@@ -460,7 +513,10 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
   const [config, setConfig] = useState(() => readConfig(storage, t('label')))
   // Detection is the default path: a pane with no URL says what it is doing
   // instead of asking for something the app already knows.
-  const [detecting, setDetecting] = useState(() => !config.url)
+  // The pane always frames *something*: a stored address, or — when there is
+  // none — the default page on this machine, refined by detection a moment
+  // later. Frames are never gated behind a form or a waiting screen.
+  const [ownGateway, setOwnGateway] = useState(false)
   const [detectError, setDetectError] = useState('')
   const [detectTick, setDetectTick] = useState(0)
   const [editing, setEditing] = useEditRequest()
@@ -488,23 +544,14 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
 
   // Ask the app where its gateway is, then point the pane at that machine.
   //
-  // A hand-typed URL is an explicit override: detection leaves it alone. Anything
-  // derived IS re-derived on every load rather than trusted from storage, so a
-  // re-homed app (new gateway, new machine) follows along instead of framing a
-  // stale host — and the value carries the moment it was read.
+  // This refines the address in the background; it never gates the page. A
+  // hand-typed URL is an explicit override and is left alone — with one
+  // exception, the app's *own* dashboard, which can never hold a session inside
+  // a frame: that one is a dead end, so the pane derives instead and says so.
+  // Anything derived IS re-derived on every load rather than trusted from
+  // storage, so a re-homed app follows along instead of framing a stale host.
   useEffect(() => {
-    const stored = readConfig(storage, tRef.current('label'))
-
-    // A typed address is an explicit override — and so is one stored by an
-    // earlier version, which had nothing else it could be. Detection fills a
-    // gap; it never takes an address back.
-    if (stored.source === 'manual' || (stored.url && stored.source !== 'gateway')) {
-      return undefined
-    }
-
     let cancelled = false
-
-    setDetecting(true)
 
     gatewayPage()
       .then((page) => {
@@ -512,20 +559,34 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
           return
         }
 
-        const current = readConfig(storage, tRef.current('label'))
+        const stored = readConfig(storage, tRef.current('label'))
+        const deadEnd = isOwnGatewayUrl(stored.url, page.gatewayOrigin)
+
+        // A saved address the user chose is respected — unless it is the app's
+        // own dashboard, or it was derived in the first place.
+        if (!deadEnd && (stored.source === 'manual' || (stored.url && stored.source !== 'gateway'))) {
+          setOwnGateway(false)
+          setDetectError('')
+          return
+        }
+
+        setOwnGateway(deadEnd)
+        setDetectError('')
+
+        if (stored.url === page.url) {
+          return
+        }
 
         storage.set(STORAGE_URL, page.url)
         storage.set(STORAGE_SOURCE, 'gateway')
         storage.set(STORAGE_DETECTED_AT, page.detectedAt)
         setConfig({
           detectedAt: page.detectedAt,
-          label: current.label,
-          refresh: current.refresh,
+          label: stored.label,
+          refresh: stored.refresh,
           source: 'gateway',
           url: page.url
         })
-        setDetecting(false)
-        setDetectError('')
         setFrame({ state: 'loading', at: null })
         setNonce((value) => value + 1)
       })
@@ -534,7 +595,6 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
           return
         }
 
-        setDetecting(false)
         setDetectError(String((failure && failure.message) || failure || 'unknown'))
       })
 
@@ -668,47 +728,13 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
     setError('')
   }, [setEditing])
 
-  // Cold start. Detection comes first — the address is normally the app's own
-  // business, not the user's — so the pane says what it is reading rather than
-  // opening with a form. The form appears only when the app cannot be asked, or
-  // when the user asked to type one.
-  if (!config.url && !editing && detecting) {
-    return jsxs('div', {
-      className: 'flex h-full flex-col items-center justify-center gap-2 p-6 text-(--ui-text-tertiary)',
-      'data-fleet-state': 'detecting',
-      role: 'status',
-      children: [
-        jsx(GlyphSpinner, { ariaLabel: t('detecting') }),
-        jsx('span', { className: CAPTION, children: t('detecting') })
-      ]
-    })
-  }
-
-  if (!config.url && !editing) {
-    return jsxs('div', {
-      className: 'flex h-full flex-col items-center justify-center gap-3 p-6',
-      'data-fleet-state': 'unconfigured',
-      children: [
-        jsx(EmptyState, {
-          title: t('setupTitle'),
-          description: detectError
-            ? `${t('detectFailed')} — ${t('detectFailedBody')} (${detectError})`
-            : t('setupBody')
-        }),
-        jsxs('div', {
-          className: 'flex items-center gap-2',
-          children: [
-            jsx(Button, { onClick: () => setEditing(true), children: t('emptyAction') }),
-            jsx(Button, { variant: 'ghost', onClick: detect, children: t('retry') })
-          ]
-        })
-      ]
-    })
-  }
-
-  if (!config.url || editing) {
+  // The form is the exception, not the entrance: it appears when the user asks
+  // for it, and the page is the view otherwise.
+  if (editing) {
     return jsx(Form, { t, draft, setDraft, error, onSave: save, onCancel: cancel, onUseGateway: useGateway })
   }
+
+  const pageUrl = config.url || defaultPageUrl()
 
   const tone = frame.state === 'ready' ? 'good' : frame.state === 'slow' ? 'warn' : 'muted'
   const status =
@@ -733,8 +759,8 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
           }),
           jsx('span', {
             className: `truncate ${CAPTION} text-(--ui-text-tertiary)`,
-            title: config.url,
-            children: config.url
+            title: pageUrl,
+            children: pageUrl
           }),
           // Where the address came from, dated when it was read from the app —
           // a derived value must never look like a setting the user has seen.
@@ -784,6 +810,31 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
           })
         ]
       }),
+      ownGateway
+        ? jsxs('div', {
+            className: `flex items-center gap-3 border-b border-(--ui-border) bg-amber-500/10 px-3 py-2 ${CAPTION}`,
+            'data-fleet-notice': 'own-gateway',
+            role: 'status',
+            children: [
+              jsx('span', { className: 'shrink-0 font-medium text-(--ui-text-primary)', children: t('ownGatewayNotice') }),
+              jsx('span', { className: 'flex-1' }),
+              jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => setEditing(true), children: t('change') })
+            ]
+          })
+        : !config.url && detectError
+          ? jsxs('div', {
+              className: `flex items-center gap-3 border-b border-(--ui-border) bg-amber-500/10 px-3 py-2 ${CAPTION}`,
+              'data-fleet-notice': 'no-registry',
+              role: 'status',
+              children: [
+                jsx('span', { className: 'shrink-0 font-medium text-(--ui-text-primary)', children: t('noRegistryNotice') }),
+                jsx('span', { className: 'truncate text-(--ui-text-secondary)', children: detectError }),
+                jsx('span', { className: 'flex-1' }),
+                jsx(Button, { size: 'xs', variant: 'secondary', onClick: detect, children: t('retry') }),
+                jsx(Button, { size: 'xs', variant: 'ghost', onClick: () => setEditing(true), children: t('change') })
+              ]
+            })
+          : null,
       frame.state === 'slow'
         ? jsxs('div', {
             className: `flex items-center gap-3 border-b border-(--ui-border) bg-amber-500/10 px-3 py-2 ${CAPTION}`,
@@ -815,7 +866,7 @@ export function Page({ storage, os, slowMs = SLOW_MS }) {
           jsx(
             'iframe',
             {
-              src: config.url,
+              src: pageUrl,
               title: config.label,
               className: cn('h-full w-full border-0', frame.state === 'ready' ? 'bg-white' : 'bg-transparent'),
               referrerPolicy: 'no-referrer',
